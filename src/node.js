@@ -1,5 +1,5 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
 import { detectModelType, parseConfigText } from "./model-types.js";
 
@@ -26,15 +26,33 @@ function resolveHfBaseUrl(repoId, revision = "main", endpoint = "https://hugging
   return `${endpoint.replace(/\/$/, "")}/${repoId}/resolve/${safeRevision}`;
 }
 
+function resolveHfApiBase(endpoint = "https://huggingface.co") {
+  return endpoint.replace(/\/$/, "");
+}
+
 function modelFilenameCandidates(filename, quantization = "int8") {
-  if (
-    quantization === "int8" &&
-    filename.endsWith(".onnx") &&
-    !filename.endsWith(".int8.onnx")
-  ) {
-    return [filename.replace(/\.onnx$/, ".int8.onnx"), filename];
+  if (!filename.endsWith(".onnx")) {
+    return [filename];
   }
-  return [filename];
+
+  if (quantization !== "int8") {
+    return [filename];
+  }
+
+  const dotInt8 = filename.replace(/\.onnx$/, ".int8.onnx");
+  const underscoreInt8 = filename.replace(/\.onnx$/, "_int8.onnx");
+  const unique = new Set([dotInt8, underscoreInt8, filename]);
+  return [...unique];
+}
+
+function sidecarCandidates(onnxPath) {
+  if (!onnxPath.endsWith(".onnx")) {
+    return [];
+  }
+  return [
+    `${onnxPath}.data`,
+    onnxPath.replace(/\.onnx$/, ".onnx_data"),
+  ];
 }
 
 async function fileExists(path) {
@@ -66,6 +84,7 @@ async function fetchOptional(url, { fetchImpl, headers }) {
 }
 
 async function writeResponseToFile(response, filePath) {
+  await mkdir(dirname(filePath), { recursive: true });
   const bytes = new Uint8Array(await response.arrayBuffer());
   await writeFile(filePath, bytes);
 }
@@ -95,33 +114,92 @@ async function selectOrReadVocabulary(dir, candidates) {
   return { filename: existing, text };
 }
 
-async function downloadModelWithFallback(baseUrl, modelDir, filename, options) {
-  const candidates = modelFilenameCandidates(filename, options.quantization);
+async function walkFiles(root, prefix = "") {
+  const entries = await readdir(join(root, prefix), { withFileTypes: true });
+  const out = [];
 
-  for (const candidate of candidates) {
-    const modelUrl = `${baseUrl}/${candidate}`;
-    const modelPath = join(modelDir, candidate);
-
-    const response = await options.fetchImpl(modelUrl, { headers: options.headers });
-    if (response.status === 404 && candidate !== candidates[candidates.length - 1]) {
-      continue;
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...(await walkFiles(root, rel)));
+    } else if (entry.isFile()) {
+      out.push(rel);
     }
-    if (!response.ok) {
-      throw new Error(`Failed to download ${modelUrl}: ${response.status} ${response.statusText}`);
-    }
-
-    await writeResponseToFile(response, modelPath);
-
-    const sidecar = `${candidate}.data`;
-    const sidecarResponse = await fetchOptional(`${baseUrl}/${sidecar}`, options);
-    if (sidecarResponse) {
-      await writeResponseToFile(sidecarResponse, join(modelDir, sidecar));
-    }
-
-    return candidate;
   }
 
-  return candidates[candidates.length - 1];
+  return out;
+}
+
+function pickQuantizedByPattern(files, pattern, quantization = "int8") {
+  const matches = files.filter((file) => pattern.test(file));
+  if (matches.length === 0) {
+    return null;
+  }
+  if (quantization === "int8") {
+    const int8 = matches.find((name) => /(?:\.int8|_int8)\.onnx$/.test(name));
+    if (int8) {
+      return int8;
+    }
+  }
+  const plain = matches.find((name) => name.endsWith(".onnx") && !/(?:\.int8|_int8)\.onnx$/.test(name));
+  return plain ?? matches[0];
+}
+
+async function listHuggingFaceRepoFiles(repoId, revision, endpoint, requestOptions) {
+  const apiBase = resolveHfApiBase(endpoint);
+  const url = `${apiBase}/api/models/${repoId}/tree/${encodeURIComponent(revision)}?recursive=1`;
+  const response = await fetchRequired(url, requestOptions);
+  const payload = await response.json();
+  const files = payload
+    .map((item) => item.path)
+    .filter((path) => typeof path === "string");
+  return new Set(files);
+}
+
+async function downloadPath(baseUrl, modelDir, relativePath, requestOptions, { required = true } = {}) {
+  const url = `${baseUrl}/${relativePath}`;
+  const localPath = join(modelDir, relativePath);
+  const response = required
+    ? await fetchRequired(url, requestOptions)
+    : await fetchOptional(url, requestOptions);
+
+  if (!response) {
+    return false;
+  }
+
+  await writeResponseToFile(response, localPath);
+  return true;
+}
+
+async function ensureSidecars(baseUrl, modelDir, modelPath, requestOptions, repoFiles = null) {
+  for (const sidecar of sidecarCandidates(modelPath)) {
+    const local = join(modelDir, sidecar);
+    if (await fileExists(local)) {
+      continue;
+    }
+
+    if (repoFiles && !repoFiles.has(sidecar)) {
+      continue;
+    }
+
+    await downloadPath(baseUrl, modelDir, sidecar, requestOptions, { required: false });
+  }
+}
+
+async function resolveWhisperLocalArtifacts(modelDir, quantization) {
+  const files = await walkFiles(modelDir);
+  const beamsearch = pickQuantizedByPattern(files, /_beamsearch(?:\.int8)?\.onnx$/, quantization);
+  if (!beamsearch) {
+    throw new Error("Could not find whisper-ort beamsearch ONNX file.");
+  }
+
+  const vocabPath = files.includes("vocab.json") ? "vocab.json" : null;
+  if (!vocabPath) {
+    throw new Error("Missing vocab.json for whisper model.");
+  }
+
+  const addedTokensPath = files.includes("added_tokens.json") ? "added_tokens.json" : null;
+  return { beamsearch, vocabPath, addedTokensPath };
 }
 
 export async function loadLocalModel(modelDir, options = {}) {
@@ -129,6 +207,41 @@ export async function loadLocalModel(modelDir, options = {}) {
   const configText = await readFile(join(modelDir, "config.json"), "utf8");
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
+
+  if (spec.decoderKind === "whisper-ort") {
+    const artifacts = await resolveWhisperLocalArtifacts(modelDir, quantization);
+    return createAsrModel({
+      modelType,
+      decoderKind: spec.decoderKind,
+      config,
+      whisperModel: join(modelDir, artifacts.beamsearch),
+      vocabJson: await readFile(join(modelDir, artifacts.vocabPath), "utf8"),
+      addedTokensJson: artifacts.addedTokensPath
+        ? await readFile(join(modelDir, artifacts.addedTokensPath), "utf8")
+        : "{}",
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
+
+  if (spec.decoderKind === "whisper-hf") {
+    const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
+    const decoderFile = await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization);
+
+    return createAsrModel({
+      modelType,
+      decoderKind: spec.decoderKind,
+      config,
+      encoderModel: join(modelDir, encoderFile),
+      decoderJointModel: join(modelDir, decoderFile),
+      vocabJson: await readFile(join(modelDir, "vocab.json"), "utf8"),
+      addedTokensJson: (await fileExists(join(modelDir, "added_tokens.json")))
+        ? await readFile(join(modelDir, "added_tokens.json"), "utf8")
+        : "{}",
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
 
   const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
   const decoderFile = spec.decoderJoint
@@ -173,47 +286,90 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
 
   const configPath = join(modelDir, "config.json");
   if (options.forceDownload || !(await fileExists(configPath))) {
-    const configResponse = await fetchRequired(`${baseUrl}/config.json`, requestOptions);
-    await writeResponseToFile(configResponse, configPath);
+    await downloadPath(baseUrl, modelDir, "config.json", requestOptions, { required: true });
   }
 
   const config = parseConfigText(await readFile(configPath, "utf8"));
   const { spec } = detectModelType(config);
 
+  if (spec.decoderKind === "whisper-ort") {
+    const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+    const modelPath = pickQuantizedByPattern([...repoFiles], /_beamsearch(?:\.int8)?\.onnx$/, quantization);
+    if (!modelPath) {
+      throw new Error("Could not find whisper-ort beamsearch model in Hugging Face repo.");
+    }
+
+    if (options.forceDownload || !(await fileExists(join(modelDir, modelPath)))) {
+      await downloadPath(baseUrl, modelDir, modelPath, requestOptions, { required: true });
+    }
+
+    if (repoFiles.has("vocab.json") && (options.forceDownload || !(await fileExists(join(modelDir, "vocab.json"))))) {
+      await downloadPath(baseUrl, modelDir, "vocab.json", requestOptions, { required: true });
+    }
+    if (repoFiles.has("added_tokens.json") && (options.forceDownload || !(await fileExists(join(modelDir, "added_tokens.json"))))) {
+      await downloadPath(baseUrl, modelDir, "added_tokens.json", requestOptions, { required: true });
+    }
+
+    return modelDir;
+  }
+
+  if (spec.decoderKind === "whisper-hf") {
+    const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+
+    const modelFiles = [spec.encoder, spec.decoderJoint];
+    for (const baseFile of modelFiles) {
+      const candidates = modelFilenameCandidates(baseFile, quantization);
+      const selected = candidates.find((path) => repoFiles.has(path)) ?? candidates[candidates.length - 1];
+
+      if (options.forceDownload || !(await fileExists(join(modelDir, selected)))) {
+        await downloadPath(baseUrl, modelDir, selected, requestOptions, { required: true });
+      }
+      await ensureSidecars(baseUrl, modelDir, selected, requestOptions, repoFiles);
+    }
+
+    for (const file of ["vocab.json", "added_tokens.json", "tokenizer.json"]) {
+      if (repoFiles.has(file) && (options.forceDownload || !(await fileExists(join(modelDir, file))))) {
+        await downloadPath(baseUrl, modelDir, file, requestOptions, { required: true });
+      }
+    }
+
+    return modelDir;
+  }
+
   const modelFiles = [spec.encoder, ...(spec.decoderJoint ? [spec.decoderJoint] : []), ...(spec.preprocessor ? [spec.preprocessor] : [])];
 
   for (const filename of modelFiles) {
     const candidates = modelFilenameCandidates(filename, quantization);
+    const existing = options.forceDownload ? null : await selectExistingFile(modelDir, candidates);
+    const selected = existing ?? candidates[candidates.length - 1];
 
-    if (!options.forceDownload) {
-      const existing = await selectExistingFile(modelDir, candidates);
-      if (existing) {
-        const sidecarName = `${existing}.data`;
-        const sidecarPath = join(modelDir, sidecarName);
-        if (!(await fileExists(sidecarPath))) {
-          const sidecarResponse = await fetchOptional(`${baseUrl}/${sidecarName}`, requestOptions);
-          if (sidecarResponse) {
-            await writeResponseToFile(sidecarResponse, sidecarPath);
-          }
+    if (!existing || options.forceDownload) {
+      let downloaded = false;
+      for (const candidate of candidates) {
+        const ok = await downloadPath(baseUrl, modelDir, candidate, requestOptions, { required: false });
+        if (ok) {
+          downloaded = true;
+          await ensureSidecars(baseUrl, modelDir, candidate, requestOptions);
+          break;
         }
-        continue;
       }
+      if (!downloaded) {
+        throw new Error(`Unable to download model file for ${filename}`);
+      }
+    } else {
+      await ensureSidecars(baseUrl, modelDir, selected, requestOptions);
     }
-
-    await downloadModelWithFallback(baseUrl, modelDir, filename, requestOptions);
   }
 
   const vocabularyName = await selectExistingFile(modelDir, spec.vocabCandidates);
   if (!vocabularyName || options.forceDownload) {
     let downloaded = false;
     for (const vocabCandidate of spec.vocabCandidates) {
-      const response = await fetchOptional(`${baseUrl}/${vocabCandidate}`, requestOptions);
-      if (!response) {
-        continue;
+      const ok = await downloadPath(baseUrl, modelDir, vocabCandidate, requestOptions, { required: false });
+      if (ok) {
+        downloaded = true;
+        break;
       }
-      await writeResponseToFile(response, join(modelDir, vocabCandidate));
-      downloaded = true;
-      break;
     }
     if (!downloaded && !vocabularyName) {
       throw new Error(`Unable to download vocabulary file. Tried: ${spec.vocabCandidates.join(", ")}`);

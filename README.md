@@ -9,6 +9,8 @@ Detected automatically from `config.json`:
 - `nemo-conformer-tdt`
 - `nemo-conformer-rnnt`
 - `nemo-conformer-ctc`
+- `whisper-ort`
+- `whisper`
 
 ## Install
 
@@ -61,11 +63,15 @@ console.log(result.words); // [{word, start, end}] in seconds
 - TDT (`nemo-conformer-tdt`): `nemo128.onnx`, `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt` or `tokens.txt`
 - RNNT (`nemo-conformer-rnnt`): `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt` or `tokens.txt`
 - CTC (`nemo-conformer-ctc`): `model.onnx` and `vocab.txt` or `tokens.txt`
+- Whisper ORT (`whisper-ort`): `*_beamsearch.onnx` model, plus `vocab.json` (and optionally `added_tokens.json`)
+- Whisper HF (`whisper`): `onnx/encoder_model*.onnx`, `onnx/decoder_model_merged*.onnx`, plus `vocab.json` (and optionally `added_tokens.json`)
 
 When quantization is enabled (`quantization: "int8"`), `*.int8.onnx` is preferred.
 
 For Node Hugging Face downloads, `*.onnx.data` sidecars are also fetched when present.
 In browser mode, models are loaded by URL so ONNX Runtime can fetch sidecars automatically.
+
+Word timestamps are currently provided for NeMo transducer models. Whisper returns transcript text and token IDs; `words` is empty.
 
 ## Examples
 

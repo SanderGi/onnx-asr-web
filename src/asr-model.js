@@ -8,6 +8,7 @@ import {
   PreprocessorModel,
   TransducerGreedyDecoder,
 } from "./models.js";
+import { WhisperHfModel, WhisperOrtModel } from "./whisper.js";
 
 export function configureOrtWeb(options = {}) {
   if (options.numThreads != null) {
@@ -193,14 +194,50 @@ export async function createAsrModel({
   preprocessorModel,
   encoderModel,
   decoderJointModel,
+  whisperModel,
   vocabularyText,
+  vocabJson,
+  addedTokensJson,
   sessionOptions,
   decoderOptions,
 } = {}) {
-  if (!modelType || !decoderKind || !encoderModel || !vocabularyText) {
+  if (!modelType || !decoderKind) {
     throw new Error(
-      "createAsrModel expects modelType, decoderKind, encoderModel, and vocabularyText.",
+      "createAsrModel expects modelType and decoderKind.",
     );
+  }
+  if (decoderKind === "whisper-ort") {
+    if (!whisperModel || !vocabJson) {
+      throw new Error("whisper-ort requires whisperModel and vocabJson.");
+    }
+    const session = await ort.InferenceSession.create(whisperModel, sessionOptions);
+    return new WhisperOrtModel({
+      config,
+      vocab: JSON.parse(vocabJson),
+      addedTokens: addedTokensJson ? JSON.parse(addedTokensJson) : {},
+      session,
+    });
+  }
+
+  if (decoderKind === "whisper-hf") {
+    if (!encoderModel || !decoderJointModel || !vocabJson) {
+      throw new Error("whisper requires encoderModel, decoderJointModel, and vocabJson.");
+    }
+    const [encoderSession, decoderSession] = await Promise.all([
+      ort.InferenceSession.create(encoderModel, sessionOptions),
+      ort.InferenceSession.create(decoderJointModel, sessionOptions),
+    ]);
+    return new WhisperHfModel({
+      config,
+      vocab: JSON.parse(vocabJson),
+      addedTokens: addedTokensJson ? JSON.parse(addedTokensJson) : {},
+      encoderSession,
+      decoderSession,
+    });
+  }
+
+  if (!encoderModel || !vocabularyText) {
+    throw new Error("createAsrModel expects encoderModel and vocabularyText for non-whisper models.");
   }
   if (decoderKind !== "ctc" && !decoderJointModel) {
     throw new Error("Transducer models require decoderJointModel.");

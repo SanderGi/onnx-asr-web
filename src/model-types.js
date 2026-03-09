@@ -20,6 +20,20 @@ export const MODEL_TYPES = {
     decoderJoint: null,
     vocabCandidates: ["vocab.txt", "tokens.txt"],
   },
+  "whisper-ort": {
+    decoderKind: "whisper-ort",
+    preprocessor: null,
+    encoder: null,
+    decoderJoint: null,
+    whisperModelPattern: /_beamsearch(?:\\.int8)?\\.onnx$/,
+  },
+  whisper: {
+    decoderKind: "whisper-hf",
+    preprocessor: null,
+    encoder: "onnx/encoder_model.onnx",
+    decoderJoint: "onnx/decoder_model_merged.onnx",
+    vocabCandidates: [],
+  },
 };
 
 export function parseConfigText(configText) {
