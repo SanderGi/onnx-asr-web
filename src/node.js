@@ -1,12 +1,9 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import {
-  createParakeetAsrModel,
-  DEFAULT_MODEL_FILES,
-  configureOrtWeb,
-} from "./asr-model.js";
+import { configureOrtWeb, createAsrModel } from "./asr-model.js";
+import { detectModelType, parseConfigText } from "./model-types.js";
 
-export { configureOrtWeb, DEFAULT_MODEL_FILES };
+export { configureOrtWeb };
 
 function normalizeRepoId(repoId) {
   const parts = repoId
@@ -49,17 +46,6 @@ async function fileExists(path) {
   }
 }
 
-async function selectLocalModelFile(modelDir, filename, quantization) {
-  const candidates = modelFilenameCandidates(filename, quantization);
-  for (const candidate of candidates) {
-    if (await fileExists(join(modelDir, candidate))) {
-      return candidate;
-    }
-  }
-
-  return candidates[candidates.length - 1];
-}
-
 async function fetchRequired(url, { fetchImpl, headers }) {
   const response = await fetchImpl(url, { headers });
   if (!response.ok) {
@@ -84,6 +70,31 @@ async function writeResponseToFile(response, filePath) {
   await writeFile(filePath, bytes);
 }
 
+async function selectExistingFile(dir, candidates) {
+  for (const candidate of candidates) {
+    if (await fileExists(join(dir, candidate))) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function selectOrFallbackModelFile(dir, filename, quantization) {
+  const candidates = modelFilenameCandidates(filename, quantization);
+  const existing = await selectExistingFile(dir, candidates);
+  return existing ?? candidates[candidates.length - 1];
+}
+
+async function selectOrReadVocabulary(dir, candidates) {
+  const existing = await selectExistingFile(dir, candidates);
+  if (!existing) {
+    throw new Error(`Missing vocabulary file. Checked: ${candidates.join(", ")}`);
+  }
+
+  const text = await readFile(join(dir, existing), "utf8");
+  return { filename: existing, text };
+}
+
 async function downloadModelWithFallback(baseUrl, modelDir, filename, options) {
   const candidates = modelFilenameCandidates(filename, options.quantization);
 
@@ -101,12 +112,10 @@ async function downloadModelWithFallback(baseUrl, modelDir, filename, options) {
 
     await writeResponseToFile(response, modelPath);
 
-    // External ONNX data file is optional but required for some exports.
-    const sidecarName = `${candidate}.data`;
-    const sidecarUrl = `${baseUrl}/${sidecarName}`;
-    const sidecarResponse = await fetchOptional(sidecarUrl, options);
+    const sidecar = `${candidate}.data`;
+    const sidecarResponse = await fetchOptional(`${baseUrl}/${sidecar}`, options);
     if (sidecarResponse) {
-      await writeResponseToFile(sidecarResponse, join(modelDir, sidecarName));
+      await writeResponseToFile(sidecarResponse, join(modelDir, sidecar));
     }
 
     return candidate;
@@ -115,40 +124,43 @@ async function downloadModelWithFallback(baseUrl, modelDir, filename, options) {
   return candidates[candidates.length - 1];
 }
 
-export async function createParakeetFromLocalDir(modelDir, options = {}) {
-  const files = { ...DEFAULT_MODEL_FILES, ...(options.files ?? {}) };
+export async function loadLocalModel(modelDir, options = {}) {
   const quantization = options.quantization ?? "int8";
+  const configText = await readFile(join(modelDir, "config.json"), "utf8");
+  const config = parseConfigText(configText);
+  const { modelType, spec } = detectModelType(config);
 
-  const [preprocessorFile, encoderFile, decoderJointFile] = await Promise.all([
-    selectLocalModelFile(modelDir, files.preprocessor, quantization),
-    selectLocalModelFile(modelDir, files.encoder, quantization),
-    selectLocalModelFile(modelDir, files.decoderJoint, quantization),
-  ]);
+  const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
+  const decoderFile = await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization);
+  const preprocessorFile = spec.preprocessor
+    ? await selectOrFallbackModelFile(modelDir, spec.preprocessor, quantization)
+    : null;
+  const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
 
-  const tokensText = await readFile(join(modelDir, files.tokens), "utf8");
-
-  return createParakeetAsrModel({
-    preprocessorModel: join(modelDir, preprocessorFile),
+  return createAsrModel({
+    modelType,
+    decoderKind: spec.decoderKind,
+    config,
+    preprocessorModel: preprocessorFile ? join(modelDir, preprocessorFile) : null,
     encoderModel: join(modelDir, encoderFile),
-    decoderJointModel: join(modelDir, decoderJointFile),
-    tokensText,
+    decoderJointModel: join(modelDir, decoderFile),
+    vocabularyText: vocabulary.text,
     sessionOptions: options.sessionOptions,
     decoderOptions: options.decoderOptions,
   });
 }
 
-export async function downloadParakeetFromHuggingFace(repoId, options = {}) {
+export async function downloadHuggingfaceModel(repoId, options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
   }
 
-  const files = { ...DEFAULT_MODEL_FILES, ...(options.files ?? {}) };
+  const quantization = options.quantization ?? "int8";
   const repoParts = normalizeRepoId(repoId);
   const cacheDir = options.cacheDir ?? "models";
   const modelDir = join(cacheDir, ...repoParts);
   const revision = options.revision ?? "main";
-  const quantization = options.quantization ?? "int8";
   const baseUrl = resolveHfBaseUrl(repoId, revision, options.endpoint);
 
   const hfToken = options.hfToken ?? process.env.HF_TOKEN;
@@ -157,29 +169,31 @@ export async function downloadParakeetFromHuggingFace(repoId, options = {}) {
 
   await mkdir(modelDir, { recursive: true });
 
-  const modelEntries = [files.preprocessor, files.encoder, files.decoderJoint];
+  const configPath = join(modelDir, "config.json");
+  if (options.forceDownload || !(await fileExists(configPath))) {
+    const configResponse = await fetchRequired(`${baseUrl}/config.json`, requestOptions);
+    await writeResponseToFile(configResponse, configPath);
+  }
 
-  for (const filename of modelEntries) {
+  const config = parseConfigText(await readFile(configPath, "utf8"));
+  const { spec } = detectModelType(config);
+
+  const modelFiles = [spec.encoder, spec.decoderJoint, ...(spec.preprocessor ? [spec.preprocessor] : [])];
+
+  for (const filename of modelFiles) {
     const candidates = modelFilenameCandidates(filename, quantization);
 
     if (!options.forceDownload) {
-      let hasAny = false;
-      for (const candidate of candidates) {
-        if (await fileExists(join(modelDir, candidate))) {
-          hasAny = true;
-          const sidecar = `${candidate}.data`;
-          const sidecarPath = join(modelDir, sidecar);
-          if (!(await fileExists(sidecarPath))) {
-            const sidecarUrl = `${baseUrl}/${sidecar}`;
-            const sidecarResponse = await fetchOptional(sidecarUrl, requestOptions);
-            if (sidecarResponse) {
-              await writeResponseToFile(sidecarResponse, sidecarPath);
-            }
+      const existing = await selectExistingFile(modelDir, candidates);
+      if (existing) {
+        const sidecarName = `${existing}.data`;
+        const sidecarPath = join(modelDir, sidecarName);
+        if (!(await fileExists(sidecarPath))) {
+          const sidecarResponse = await fetchOptional(`${baseUrl}/${sidecarName}`, requestOptions);
+          if (sidecarResponse) {
+            await writeResponseToFile(sidecarResponse, sidecarPath);
           }
-          break;
         }
-      }
-      if (hasAny) {
         continue;
       }
     }
@@ -187,17 +201,27 @@ export async function downloadParakeetFromHuggingFace(repoId, options = {}) {
     await downloadModelWithFallback(baseUrl, modelDir, filename, requestOptions);
   }
 
-  const tokensPath = join(modelDir, files.tokens);
-  if (options.forceDownload || !(await fileExists(tokensPath))) {
-    const tokensUrl = `${baseUrl}/${files.tokens}`;
-    const tokensResponse = await fetchRequired(tokensUrl, requestOptions);
-    await writeResponseToFile(tokensResponse, tokensPath);
+  const vocabularyName = await selectExistingFile(modelDir, spec.vocabCandidates);
+  if (!vocabularyName || options.forceDownload) {
+    let downloaded = false;
+    for (const vocabCandidate of spec.vocabCandidates) {
+      const response = await fetchOptional(`${baseUrl}/${vocabCandidate}`, requestOptions);
+      if (!response) {
+        continue;
+      }
+      await writeResponseToFile(response, join(modelDir, vocabCandidate));
+      downloaded = true;
+      break;
+    }
+    if (!downloaded && !vocabularyName) {
+      throw new Error(`Unable to download vocabulary file. Tried: ${spec.vocabCandidates.join(", ")}`);
+    }
   }
 
   return modelDir;
 }
 
-export async function createParakeetFromHuggingFace(repoId, options = {}) {
-  const modelDir = await downloadParakeetFromHuggingFace(repoId, options);
-  return createParakeetFromLocalDir(modelDir, options);
+export async function loadHuggingfaceModel(repoId, options = {}) {
+  const modelDir = await downloadHuggingfaceModel(repoId, options);
+  return loadLocalModel(modelDir, options);
 }

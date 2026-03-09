@@ -1,11 +1,10 @@
 import * as ort from "onnxruntime-web";
 import { firstExistingInputName, int64TensorValues, readScalarInt } from "./utils.js";
 
-function int64Tensor(values, dims) {
-  return new ort.Tensor("int64", int64TensorValues(values), dims);
-}
-
-function int32Tensor(values, dims) {
+function intTensor(type, values, dims) {
+  if (type === "int64") {
+    return new ort.Tensor("int64", int64TensorValues(values), dims);
+  }
   return new ort.Tensor("int32", Int32Array.from(values), dims);
 }
 
@@ -18,16 +17,194 @@ function ensureOutput(session, outputMap, index) {
   return tensor;
 }
 
+function valueToNumber(value) {
+  return typeof value === "bigint" ? Number(value) : value;
+}
+
+function numbersFromTensor(tensor) {
+  return Array.from(tensor.data, valueToNumber);
+}
+
+function shapeFromMetadata(metadataShape) {
+  if (!Array.isArray(metadataShape) || metadataShape.length === 0) {
+    return [1];
+  }
+
+  return metadataShape.map((dimension) =>
+    typeof dimension === "number" && dimension > 0 ? dimension : 1,
+  );
+}
+
+function product(values) {
+  return values.reduce((acc, value) => acc * value, 1);
+}
+
+function hzToMel(hz) {
+  return 2595 * Math.log10(1 + hz / 700);
+}
+
+function melToHz(mel) {
+  return 700 * (10 ** (mel / 2595) - 1);
+}
+
+function buildHannWindow(length) {
+  const window = new Float32Array(length);
+  if (length === 1) {
+    window[0] = 1;
+    return window;
+  }
+  for (let i = 0; i < length; i += 1) {
+    window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (length - 1));
+  }
+  return window;
+}
+
+function buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax }) {
+  const nFreqs = Math.floor(nFft / 2) + 1;
+  const bank = Array.from({ length: nMels }, () => new Float32Array(nFreqs));
+
+  const melMin = hzToMel(fMin);
+  const melMax = hzToMel(fMax);
+  const melPoints = new Float32Array(nMels + 2);
+  for (let i = 0; i < melPoints.length; i += 1) {
+    melPoints[i] = melMin + ((melMax - melMin) * i) / (nMels + 1);
+  }
+
+  const hzPoints = Array.from(melPoints, melToHz);
+  const bin = hzPoints.map((hz) => Math.floor(((nFft + 1) * hz) / sampleRate));
+
+  for (let m = 1; m <= nMels; m += 1) {
+    const left = bin[m - 1];
+    const center = bin[m];
+    const right = bin[m + 1];
+
+    for (let k = left; k < center; k += 1) {
+      if (k >= 0 && k < nFreqs && center > left) {
+        bank[m - 1][k] = (k - left) / (center - left);
+      }
+    }
+    for (let k = center; k < right; k += 1) {
+      if (k >= 0 && k < nFreqs && right > center) {
+        bank[m - 1][k] = (right - k) / (right - center);
+      }
+    }
+  }
+
+  return bank;
+}
+
+function powerSpectrum(frame, nFft) {
+  const bins = Math.floor(nFft / 2) + 1;
+  const out = new Float32Array(bins);
+
+  for (let k = 0; k < bins; k += 1) {
+    let real = 0;
+    let imag = 0;
+    for (let n = 0; n < nFft; n += 1) {
+      const sample = frame[n] ?? 0;
+      const angle = (2 * Math.PI * k * n) / nFft;
+      real += sample * Math.cos(angle);
+      imag -= sample * Math.sin(angle);
+    }
+    out[k] = real * real + imag * imag;
+  }
+
+  return out;
+}
+
+function logMelSpectrogram(samples, options = {}) {
+  const sampleRate = options.sampleRate ?? 16000;
+  const nMels = options.nMels ?? 80;
+  const nFft = options.nFft ?? 512;
+  const winLength = options.winLength ?? 400;
+  const hopLength = options.hopLength ?? 160;
+  const fMin = options.fMin ?? 0;
+  const fMax = options.fMax ?? sampleRate / 2;
+  const logEps = options.logEps ?? 1e-10;
+  const preemphasis = options.preemphasis ?? 0.97;
+
+  if (preemphasis > 0) {
+    const emphasized = new Float32Array(samples.length);
+    if (samples.length > 0) {
+      emphasized[0] = samples[0];
+    }
+    for (let i = 1; i < samples.length; i += 1) {
+      emphasized[i] = samples[i] - preemphasis * samples[i - 1];
+    }
+    samples = emphasized;
+  }
+
+  if (samples.length < winLength) {
+    const padded = new Float32Array(winLength);
+    padded.set(samples, 0);
+    samples = padded;
+  }
+
+  const frameCount = 1 + Math.floor((samples.length - winLength) / hopLength);
+  const frameWindow = buildHannWindow(winLength);
+  const melBank = buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax });
+
+  const features = new Float32Array(nMels * frameCount);
+  const fftFrame = new Float32Array(nFft);
+
+  for (let t = 0; t < frameCount; t += 1) {
+    const start = t * hopLength;
+    fftFrame.fill(0);
+
+    for (let i = 0; i < winLength; i += 1) {
+      fftFrame[i] = samples[start + i] * frameWindow[i];
+    }
+
+    const spectrum = powerSpectrum(fftFrame, nFft);
+    for (let m = 0; m < nMels; m += 1) {
+      const filter = melBank[m];
+      let energy = 0;
+      for (let k = 0; k < spectrum.length; k += 1) {
+        energy += spectrum[k] * filter[k];
+      }
+      features[m * frameCount + t] = Math.log(Math.max(logEps, energy));
+    }
+  }
+
+  // NeMo default behavior uses per-feature normalization.
+  for (let m = 0; m < nMels; m += 1) {
+    const offset = m * frameCount;
+    let mean = 0;
+    for (let t = 0; t < frameCount; t += 1) {
+      mean += features[offset + t];
+    }
+    mean /= frameCount;
+
+    let variance = 0;
+    for (let t = 0; t < frameCount; t += 1) {
+      const delta = features[offset + t] - mean;
+      variance += delta * delta;
+    }
+    const std = Math.sqrt(variance / frameCount) + 1e-5;
+    for (let t = 0; t < frameCount; t += 1) {
+      features[offset + t] = (features[offset + t] - mean) / std;
+    }
+  }
+
+  return {
+    features,
+    frameCount,
+    nMels,
+  };
+}
+
 export class PreprocessorModel {
   constructor(session) {
     this.session = session;
     this.inputSignalName = firstExistingInputName(session, ["input_signal", "waveforms"], 0);
     this.lengthName = firstExistingInputName(session, ["length", "waveforms_lens"], 1);
+
+    this.lengthType = session.inputMetadata.find((item) => item.name === this.lengthName)?.type ?? "int64";
   }
 
   async run(audioSamples) {
     const audioTensor = new ort.Tensor("float32", audioSamples, [1, audioSamples.length]);
-    const lengthTensor = int64Tensor([audioSamples.length], [1]);
+    const lengthTensor = intTensor(this.lengthType, [audioSamples.length], [1]);
 
     const outputs = await this.session.run({
       [this.inputSignalName]: audioTensor,
@@ -42,10 +219,45 @@ export class PreprocessorModel {
 }
 
 export class EncoderModel {
-  constructor(session) {
+  constructor(session, options = {}) {
     this.session = session;
-    this.audioSignalName = firstExistingInputName(session, ["audio_signal"], 0);
-    this.lengthName = firstExistingInputName(session, ["length"], 1);
+    this.options = options;
+    this.audioSignalName = firstExistingInputName(session, ["audio_signal", "features", "waveforms"], 0);
+    this.lengthName = firstExistingInputName(session, ["length", "features_lens", "waveforms_lens"], 1);
+
+    this.audioMetadata = session.inputMetadata.find((item) => item.name === this.audioSignalName);
+    this.lengthMetadata = session.inputMetadata.find((item) => item.name === this.lengthName);
+  }
+
+  prepareInputsFromWaveform(samples) {
+    const inputRank = this.audioMetadata?.shape?.length ?? 2;
+    if (inputRank === 2) {
+      const audioTensor = new ort.Tensor("float32", samples, [1, samples.length]);
+      const lengthType = this.lengthMetadata?.type ?? "int64";
+      const lengthTensor = intTensor(lengthType, [samples.length], [1]);
+      return { signal: audioTensor, length: lengthTensor };
+    }
+
+    if (inputRank !== 3) {
+      throw new Error(`Unsupported encoder input rank ${inputRank} for '${this.audioSignalName}'.`);
+    }
+
+    const nMelsFromShape = this.audioMetadata?.shape?.[1];
+    const configNels = this.options.config?.features_size;
+    const nMels = Number.isFinite(nMelsFromShape) ? nMelsFromShape : configNels ?? 80;
+    const mel = logMelSpectrogram(samples, {
+      sampleRate: this.options.sampleRate ?? 16000,
+      nMels,
+      // NeMo defaults for Conformer RNNT exports.
+      nFft: 512,
+      winLength: 400,
+      hopLength: 160,
+    });
+
+    const audioTensor = new ort.Tensor("float32", mel.features, [1, mel.nMels, mel.frameCount]);
+    const lengthType = this.lengthMetadata?.type ?? "int64";
+    const lengthTensor = intTensor(lengthType, [mel.frameCount], [1]);
+    return { signal: audioTensor, length: lengthTensor };
   }
 
   async run(processedSignalTensor, processedLengthTensor) {
@@ -72,49 +284,144 @@ export class EncoderModel {
   }
 }
 
-export class DecoderTdtModel {
-  constructor(session) {
+export class DecoderTransducerModel {
+  constructor(session, options = {}) {
     this.session = session;
+    this.decoderKind = options.decoderKind ?? "tdt";
+    this.vocabSize = options.vocabSize;
+
     this.encoderOutputsName = firstExistingInputName(session, ["encoder_outputs"], 0);
     this.targetsName = firstExistingInputName(session, ["targets"], 1);
-    this.targetLengthName = firstExistingInputName(session, ["target_length"], 2);
-    this.state1InName = firstExistingInputName(session, ["input_states_1"], 3);
-    this.state2InName = firstExistingInputName(session, ["input_states_2"], 4);
+    this.targetLengthName = session.inputNames.includes("target_length")
+      ? "target_length"
+      : null;
 
-    this.state1OutName = session.outputNames.includes("output_states_1")
-      ? "output_states_1"
-      : session.outputNames[2];
-    this.state2OutName = session.outputNames.includes("output_states_2")
-      ? "output_states_2"
-      : session.outputNames[3];
-  }
+    this.targetsType = session.inputMetadata.find((item) => item.name === this.targetsName)?.type ?? "int32";
+    this.targetLengthType = this.targetLengthName
+      ? session.inputMetadata.find((item) => item.name === this.targetLengthName)?.type ?? "int32"
+      : "int32";
 
-  async predict(encoderFrameData, encoderFrameDims, token, state1, state2) {
-    const outputs = await this.session.run({
-      [this.encoderOutputsName]: new ort.Tensor("float32", encoderFrameData, encoderFrameDims),
-      [this.targetsName]: int32Tensor([token], [1, 1]),
-      [this.targetLengthName]: int32Tensor([1], [1]),
-      [this.state1InName]: state1,
-      [this.state2InName]: state2,
+    this.stateInputNames = session.inputNames.filter(
+      (name) => name !== this.encoderOutputsName && name !== this.targetsName && name !== this.targetLengthName,
+    );
+
+    this.stateInputMetadata = this.stateInputNames.map((name) => {
+      const meta = session.inputMetadata.find((item) => item.name === name);
+      if (!meta) {
+        throw new Error(`Missing input metadata for decoder state '${name}'.`);
+      }
+      return meta;
     });
 
-    const logits = ensureOutput(this.session, outputs, 0);
-    const nextState1 = outputs[this.state1OutName];
-    const nextState2 = outputs[this.state2OutName];
-    if (!nextState1 || !nextState2) {
-      throw new Error("Decoder did not return recurrent state outputs.");
+    const stateOutputCandidates = session.outputNames.filter((name) => /state/i.test(name));
+    this.stateOutputNames = stateOutputCandidates.length > 0
+      ? stateOutputCandidates
+      : session.outputNames.slice(1).filter((name) => !/length/i.test(name));
+  }
+
+  initialStates() {
+    const states = new Map();
+    for (const meta of this.stateInputMetadata) {
+      const shape = shapeFromMetadata(meta.shape);
+      const length = product(shape);
+      if (meta.type !== "float32") {
+        throw new Error(`Unsupported decoder state type '${meta.type}' for '${meta.name}'.`);
+      }
+      states.set(meta.name, new ort.Tensor("float32", new Float32Array(length), shape));
+    }
+    return states;
+  }
+
+  resolveNextStates(outputs, currentStates) {
+    const nextStates = new Map();
+    for (let i = 0; i < this.stateInputNames.length; i += 1) {
+      const inputName = this.stateInputNames[i];
+      const outputName = this.stateOutputNames[i];
+      if (outputName && outputs[outputName]) {
+        nextStates.set(inputName, outputs[outputName]);
+      } else {
+        nextStates.set(inputName, currentStates.get(inputName));
+      }
+    }
+    return nextStates;
+  }
+
+  argmax(data, start, end) {
+    let maxValue = -Infinity;
+    let maxIndex = start;
+    for (let i = start; i < end; i += 1) {
+      const value = data[i];
+      if (value > maxValue) {
+        maxValue = value;
+        maxIndex = i;
+      }
+    }
+    return maxIndex;
+  }
+
+  rnntCandidates(mainOutputTensor) {
+    if (mainOutputTensor.type === "int32" || mainOutputTensor.type === "int64") {
+      return numbersFromTensor(mainOutputTensor).map((token) => ({ token, duration: 0 }));
     }
 
-    return { logits, nextState1, nextState2 };
+    const flat = mainOutputTensor.data;
+    return [{ token: this.argmax(flat, 0, flat.length), duration: 0 }];
+  }
+
+  tdtCandidates(mainOutputTensor) {
+    if (!this.vocabSize || this.vocabSize <= 0) {
+      throw new Error("TDT decoder requires a positive vocabSize.");
+    }
+
+    const flat = mainOutputTensor.data;
+    if (flat.length < this.vocabSize) {
+      throw new Error(`TDT logits length ${flat.length} is smaller than vocabSize ${this.vocabSize}.`);
+    }
+
+    const token = this.argmax(flat, 0, this.vocabSize);
+    let duration = 0;
+    if (flat.length > this.vocabSize) {
+      duration = this.argmax(flat, this.vocabSize, flat.length) - this.vocabSize;
+    }
+
+    return [{ token, duration }];
+  }
+
+  async predict(encoderFrameData, encoderFrameDims, token, states) {
+    const feeds = {
+      [this.encoderOutputsName]: new ort.Tensor("float32", encoderFrameData, encoderFrameDims),
+      [this.targetsName]: intTensor(this.targetsType, [token], [1, 1]),
+    };
+
+    if (this.targetLengthName) {
+      feeds[this.targetLengthName] = intTensor(this.targetLengthType, [1], [1]);
+    }
+
+    for (const stateName of this.stateInputNames) {
+      const state = states.get(stateName);
+      if (!state) {
+        throw new Error(`Missing decoder state '${stateName}'.`);
+      }
+      feeds[stateName] = state;
+    }
+
+    const outputs = await this.session.run(feeds);
+    const mainOutput = ensureOutput(this.session, outputs, 0);
+    const nextStates = this.resolveNextStates(outputs, states);
+
+    const candidates = this.decoderKind === "rnnt"
+      ? this.rnntCandidates(mainOutput)
+      : this.tdtCandidates(mainOutput);
+
+    return { candidates, nextStates };
   }
 }
 
-export class TdtGreedyDecoder {
+export class TransducerGreedyDecoder {
   constructor(model, options = {}) {
     this.model = model;
     this.maxSymbols = options.maxSymbols ?? 10;
-    this.blankTokenId = options.blankTokenId ?? 8192;
-    this.vocabSize = options.vocabSize ?? this.blankTokenId + 1;
+    this.blankTokenId = options.blankTokenId ?? 0;
     this.defaultDuration = options.defaultDuration ?? 1;
   }
 
@@ -136,25 +443,11 @@ export class TdtGreedyDecoder {
     throw new Error(`Unsupported encoder layout: ${encodedLayout}`);
   }
 
-  argmax(data, start, end) {
-    let maxValue = -Infinity;
-    let maxIndex = start;
-    for (let i = start; i < end; i += 1) {
-      const value = data[i];
-      if (value > maxValue) {
-        maxValue = value;
-        maxIndex = i;
-      }
-    }
-    return maxIndex;
-  }
-
   async decode(encodedData, encodedDims, encodedLayout, encodedLength) {
     const tokenIds = [];
     const tokenFrames = [];
     let currentToken = this.blankTokenId;
-    let state1 = new ort.Tensor("float32", new Float32Array(2 * 1 * 640), [2, 1, 640]);
-    let state2 = new ort.Tensor("float32", new Float32Array(2 * 1 * 640), [2, 1, 640]);
+    let states = this.model.initialStates();
     let t = 0;
 
     const timeSteps = encodedLayout === "BCT" ? encodedDims[2] : 0;
@@ -166,30 +459,36 @@ export class TdtGreedyDecoder {
       const emittedIndexes = [];
 
       for (let n = 0; n < this.maxSymbols; n += 1) {
-        const { logits, nextState1, nextState2 } = await this.model.predict(
+        const { candidates, nextStates } = await this.model.predict(
           frame.data,
           frame.dims,
           currentToken,
-          state1,
-          state2,
+          states,
         );
 
-        const flat = logits.data;
-        const token = this.argmax(flat, 0, this.vocabSize);
-        const duration = this.argmax(flat, this.vocabSize, flat.length) - this.vocabSize;
+        let consumed = false;
 
-        if (token !== this.blankTokenId) {
-          const emissionIndex = tokenIds.length;
-          tokenIds.push(token);
-          tokenFrames.push({ startFrame: t, endFrame: t + this.defaultDuration });
-          emittedIndexes.push(emissionIndex);
-          currentToken = token;
-          state1 = nextState1;
-          state2 = nextState2;
+        for (const candidate of candidates) {
+          const token = valueToNumber(candidate.token);
+          const duration = valueToNumber(candidate.duration);
+
+          if (token !== this.blankTokenId) {
+            const emissionIndex = tokenIds.length;
+            tokenIds.push(token);
+            tokenFrames.push({ startFrame: t, endFrame: t + this.defaultDuration });
+            emittedIndexes.push(emissionIndex);
+            currentToken = token;
+            states = nextStates;
+          }
+
+          if (duration > 0) {
+            nextT = t + duration;
+            consumed = true;
+            break;
+          }
         }
 
-        if (duration > 0) {
-          nextT = t + duration;
+        if (consumed) {
           break;
         }
       }

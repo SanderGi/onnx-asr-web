@@ -1,4 +1,4 @@
-import { createParakeetFromBaseUrl, configureOrtWeb } from "../../src/browser.js";
+import { configureOrtWeb, loadLocalModel } from "../../src/browser.js";
 
 const output = document.getElementById("output");
 const wordsRoot = document.getElementById("words");
@@ -118,7 +118,7 @@ runButton.addEventListener("click", async () => {
     output.textContent = "Loading model...";
     wordsRoot.textContent = "";
     if (!modelPromise) {
-      modelPromise = createParakeetFromBaseUrl(baseUrl, {
+      modelPromise = loadLocalModel(baseUrl, {
         sessionOptions: { executionProviders: ["wasm"] },
       });
     }

@@ -1,9 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import {
-  createParakeetFromHuggingFace,
-  createParakeetFromLocalDir,
-} from "../../src/node.js";
+import { loadHuggingfaceModel, loadLocalModel } from "../../src/node.js";
 
 function parseArgs(argv) {
   const args = {};
@@ -28,18 +25,17 @@ function parseArgs(argv) {
 
 function printUsage() {
   console.log(
-    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none]"
+    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none]",
   );
   console.log("");
   console.log("Expected model files in model dir/cache:");
-  console.log("  nemo128.onnx");
+  console.log("  config.json");
   console.log("  encoder-model.onnx");
   console.log("  decoder_joint-model.onnx");
-  console.log("  vocab.txt");
+  console.log("  vocab.txt or tokens.txt");
+  console.log("  optional: nemo128.onnx (required for nemo-conformer-tdt)");
   console.log("");
-  console.log(
-    "By default, --quantization is int8 (prefers *.int8.onnx when available)."
-  );
+  console.log("By default, --quantization is int8 (prefers *.int8.onnx when available).");
 }
 
 async function main() {
@@ -50,12 +46,12 @@ async function main() {
   }
 
   const model = args.repoId
-    ? await createParakeetFromHuggingFace(args.repoId, {
+    ? await loadHuggingfaceModel(args.repoId, {
         cacheDir: args.cacheDir,
         quantization: args.quantization,
         sessionOptions: { executionProviders: ["wasm"] },
       })
-    : await createParakeetFromLocalDir(args.modelDir, {
+    : await loadLocalModel(args.modelDir, {
         quantization: args.quantization,
         sessionOptions: { executionProviders: ["wasm"] },
       });
@@ -64,8 +60,8 @@ async function main() {
   const { text, tokenIds, words } = await model.transcribeWavBuffer(
     wavBuffer.buffer.slice(
       wavBuffer.byteOffset,
-      wavBuffer.byteOffset + wavBuffer.byteLength
-    )
+      wavBuffer.byteOffset + wavBuffer.byteLength,
+    ),
   );
 
   console.log(`Audio: ${basename(args.audio)}`);
@@ -74,9 +70,7 @@ async function main() {
   if (words.length > 0) {
     console.log("Words:");
     for (const word of words) {
-      console.log(
-        `  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`
-      );
+      console.log(`  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`);
     }
   }
 }
