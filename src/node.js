@@ -1,7 +1,7 @@
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
-import { detectModelType, parseConfigText } from "./model-types.js";
+import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
 
 export { configureOrtWeb };
 
@@ -112,6 +112,17 @@ async function selectOrReadVocabulary(dir, candidates) {
 
   const text = await readFile(join(dir, existing), "utf8");
   return { filename: existing, text };
+}
+
+function vocabJsonToText(vocabJsonText) {
+  const parsed = JSON.parse(vocabJsonText);
+  const entries = Object.entries(parsed)
+    .filter(([, id]) => Number.isInteger(id))
+    .sort((a, b) => a[1] - b[1]);
+  if (entries.length === 0) {
+    throw new Error("Invalid vocab.json mapping.");
+  }
+  return `${entries.map(([token, id]) => `${token} ${id}`).join("\n")}\n`;
 }
 
 async function walkFiles(root, prefix = "") {
@@ -333,7 +344,15 @@ export async function loadLocalModel(modelDir, options = {}) {
   const preprocessorFile = spec.preprocessor
     ? await selectOrFallbackModelFile(modelDir, spec.preprocessor, quantization)
     : null;
-  const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
+  let vocabularyText = toneVocabularyTextFromConfig(config);
+  if (!vocabularyText) {
+    const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
+    if (vocabulary.filename.endsWith(".json")) {
+      vocabularyText = vocabJsonToText(vocabulary.text);
+    } else {
+      vocabularyText = vocabulary.text;
+    }
+  }
 
   return createAsrModel({
     modelType,
@@ -342,7 +361,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     preprocessorModel: preprocessorFile ? join(modelDir, preprocessorFile) : null,
     encoderModel: join(modelDir, encoderFile),
     decoderJointModel: decoderFile ? join(modelDir, decoderFile) : null,
-    vocabularyText: vocabulary.text,
+    vocabularyText,
     sessionOptions: options.sessionOptions,
     decoderOptions: options.decoderOptions,
   });

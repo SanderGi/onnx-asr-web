@@ -48,6 +48,13 @@ export const MODEL_TYPES = {
     decoderJoint: "onnx/decoder_model_merged.onnx",
     vocabCandidates: [],
   },
+  "tone-ctc": {
+    decoderKind: "tone-ctc",
+    preprocessor: null,
+    encoder: "model.onnx",
+    decoderJoint: null,
+    vocabCandidates: ["vocab.txt", "tokens.txt", "vocab.json"],
+  },
 };
 
 export function parseConfigText(configText) {
@@ -68,6 +75,10 @@ export function parseConfigText(configText) {
 export function detectModelType(config) {
   const modelType = config?.model_type;
   if (!modelType || typeof modelType !== "string") {
+    const architectures = Array.isArray(config?.architectures) ? config.architectures : [];
+    if (architectures.includes("ToneForCTC")) {
+      return { modelType: "tone-ctc", spec: MODEL_TYPES["tone-ctc"] };
+    }
     throw new Error("config.json is missing string field 'model_type'.");
   }
 
@@ -77,4 +88,21 @@ export function detectModelType(config) {
   }
 
   return { modelType, spec };
+}
+
+export function toneVocabularyTextFromConfig(config) {
+  const vocab = config?.decoder_params?.vocabulary;
+  if (!Array.isArray(vocab) || vocab.length === 0) {
+    return null;
+  }
+
+  const lines = vocab.map((token, index) => {
+    const normalized = token === " " ? "▁" : token;
+    return `${normalized} ${index}`;
+  });
+  const pad = config?.pad_token_id;
+  if (typeof pad === "number" && pad >= vocab.length) {
+    lines.push(`<blank> ${pad}`);
+  }
+  return `${lines.join("\n")}\n`;
 }

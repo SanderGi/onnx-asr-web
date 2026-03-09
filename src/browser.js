@@ -1,5 +1,5 @@
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
-import { detectModelType, parseConfigText } from "./model-types.js";
+import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
 
 export { configureOrtWeb };
 
@@ -79,6 +79,17 @@ async function resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers) 
 async function fetchFirstExistingText(baseUrl, candidates, fetchImpl, headers) {
   const url = await resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers);
   return fetchText(url, fetchImpl, headers);
+}
+
+function vocabJsonToText(vocabJsonText) {
+  const parsed = JSON.parse(vocabJsonText);
+  const entries = Object.entries(parsed)
+    .filter(([, id]) => Number.isInteger(id))
+    .sort((a, b) => a[1] - b[1]);
+  if (entries.length === 0) {
+    throw new Error("Invalid vocab.json mapping.");
+  }
+  return `${entries.map(([token, id]) => `${token} ${id}`).join("\n")}\n`;
 }
 
 async function listHuggingFaceRepoFiles(repoId, revision, endpoint, fetchImpl, headers) {
@@ -255,7 +266,16 @@ export async function loadLocalModel(baseUrl, options = {}) {
     spec.decoderJoint
       ? resolveModelUrl(baseUrl, spec.decoderJoint, { fetchImpl, headers, quantization })
       : Promise.resolve(null),
-    fetchFirstExistingText(baseUrl, spec.vocabCandidates, fetchImpl, headers),
+    (async () => {
+      const toneText = toneVocabularyTextFromConfig(config);
+      if (toneText) {
+        return toneText;
+      }
+      const vocab = await fetchFirstExistingText(baseUrl, spec.vocabCandidates, fetchImpl, headers);
+      return spec.vocabCandidates.includes("vocab.json") && vocab.trim().startsWith("{")
+        ? vocabJsonToText(vocab)
+        : vocab;
+    })(),
     spec.preprocessor
       ? resolveModelUrl(baseUrl, spec.preprocessor, { fetchImpl, headers, quantization })
       : Promise.resolve(null),

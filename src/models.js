@@ -246,17 +246,25 @@ export class EncoderModel {
     }
 
     const nMelsFromShape = this.audioMetadata?.shape?.[1];
-    const configNels = this.options.config?.features_size;
+    const fe = this.options.config?.feature_extraction_params;
+    const configNels = this.options.config?.features_size ?? fe?.n_mels;
     const nMels = Number.isFinite(nMelsFromShape) ? nMelsFromShape : configNels ?? 80;
     const isGigaam = this.options.config?.model_type === "gigaam";
+    const sampleRate = this.options.sampleRate ?? fe?.sample_rate ?? 16000;
+    const nFft = fe?.n_fft ?? 512;
+    const winLength = fe?.window_size
+      ? Math.round(Number(fe.window_size) * sampleRate)
+      : 400;
+    const hopLength = fe?.window_stride
+      ? Math.round(Number(fe.window_stride) * sampleRate)
+      : 160;
     const mel = logMelSpectrogram(samples, {
-      sampleRate: this.options.sampleRate ?? 16000,
+      sampleRate,
       nMels,
-      // NeMo defaults for Conformer RNNT exports.
-      nFft: 512,
-      winLength: 400,
-      hopLength: 160,
-      preemphasis: isGigaam ? 0 : 0.97,
+      nFft,
+      winLength,
+      hopLength,
+      preemphasis: fe?.preemphasis_coefficient ?? (isGigaam ? 0 : 0.97),
       normalize: !isGigaam,
     });
 

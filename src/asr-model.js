@@ -196,10 +196,13 @@ function intTensorFor(type, values, dims) {
 
 function zerosTensor(type, shape) {
   const size = shape.reduce((acc, value) => acc * value, 1);
-  if (type !== "float32") {
-    throw new Error(`Unsupported tensor init type '${type}'.`);
+  if (type === "float32") {
+    return new ort.Tensor("float32", new Float32Array(size), shape);
   }
-  return new ort.Tensor("float32", new Float32Array(size), shape);
+  if (type === "float16") {
+    return new ort.Tensor("float16", new Uint16Array(size), shape);
+  }
+  throw new Error(`Unsupported tensor init type '${type}'.`);
 }
 
 function argmaxSlice(data, start, length) {
@@ -627,6 +630,130 @@ export class GigaamRnntModel {
   }
 }
 
+export class ToneCtcModel {
+  constructor({ config, tokens, session }) {
+    this.config = config;
+    this.tokens = tokens;
+    this.session = session;
+    this.sampleRate =
+      Number(config?.feature_extraction_params?.sample_rate)
+      || Number(config?.sample_rate)
+      || 8000;
+    this.blankTokenId =
+      Number.isInteger(config?.pad_token_id) ? config.pad_token_id : detectBlankTokenId(tokens);
+
+    this.signalName = session.inputNames[0];
+    this.stateName = session.inputNames[1];
+    this.logitsName = session.outputNames[0];
+    this.nextStateName = session.outputNames[1];
+
+    this.signalMeta = metaForName(session, this.signalName);
+    this.stateMeta = metaForName(session, this.stateName);
+    this.chunkSamples = typeof this.signalMeta?.shape?.[1] === "number"
+      ? this.signalMeta.shape[1]
+      : 2400;
+    this.stateType = this.stateMeta?.type ?? "float16";
+    this.stateShape = shapeFromMeta(this.stateMeta, { batch: 1 });
+  }
+
+  toIntPcm(samples) {
+    const out = new Int32Array(samples.length);
+    for (let i = 0; i < samples.length; i += 1) {
+      const v = Math.max(-1, Math.min(1, samples[i]));
+      out[i] = Math.round(v * 32767);
+    }
+    return out;
+  }
+
+  decodeCtcGreedy(tokens, tokenFrames, sequence, frameStartIndex) {
+    let prev = this.blankTokenId;
+    for (let i = 0; i < sequence.length; i += 1) {
+      const token = sequence[i];
+      const t = frameStartIndex + i;
+      if (token === this.blankTokenId) {
+        prev = this.blankTokenId;
+        continue;
+      }
+      if (token === prev) {
+        const last = tokenFrames[tokenFrames.length - 1];
+        if (last) {
+          last.endFrame = t + 1;
+        }
+        continue;
+      }
+      tokens.push(token);
+      tokenFrames.push({ startFrame: t, endFrame: t + 1 });
+      prev = token;
+    }
+  }
+
+  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+    let prepared = samples;
+    if (!(prepared instanceof Float32Array)) {
+      prepared = Float32Array.from(prepared);
+    }
+    if (sampleRate !== this.sampleRate) {
+      prepared = resampleLinear(prepared, sampleRate, this.sampleRate);
+    }
+
+    const pcm = this.toIntPcm(prepared);
+    let state = zerosTensor(this.stateType, this.stateShape);
+
+    const tokenIds = [];
+    const tokenFrames = [];
+    let frameOffset = 0;
+    let consumedSamples = 0;
+
+    while (consumedSamples < pcm.length) {
+      const end = Math.min(consumedSamples + this.chunkSamples, pcm.length);
+      const chunk = new Int32Array(this.chunkSamples);
+      chunk.set(pcm.subarray(consumedSamples, end), 0);
+      const signal = new ort.Tensor("int32", chunk, [1, this.chunkSamples, 1]);
+
+      const outputs = await this.session.run({
+        [this.signalName]: signal,
+        [this.stateName]: state,
+      });
+      const logprobs = outputs[this.logitsName];
+      const nextState = outputs[this.nextStateName];
+      if (!logprobs || !nextState) {
+        throw new Error("Tone CTC model outputs are missing logprobs or state_next.");
+      }
+      state = nextState;
+
+      const [batch, timeSteps, vocabSize] = logprobs.dims;
+      if (batch !== 1) {
+        throw new Error(`Tone CTC currently expects batch=1, got ${batch}.`);
+      }
+
+      const frameTokens = [];
+      for (let t = 0; t < timeSteps; t += 1) {
+        const offset = t * vocabSize;
+        frameTokens.push(argmaxSlice(logprobs.data, offset, vocabSize));
+      }
+      this.decodeCtcGreedy(tokenIds, tokenFrames, frameTokens, frameOffset);
+      frameOffset += timeSteps;
+      consumedSamples = end;
+    }
+
+    const secondsPerFrame = frameOffset > 0
+      ? prepared.length / this.sampleRate / frameOffset
+      : 0;
+
+    return {
+      tokenIds,
+      tokenFrames,
+      words: wordTimestamps(this.tokens, tokenIds, tokenFrames, secondsPerFrame),
+      text: decodeText(this.tokens, tokenIds),
+    };
+  }
+
+  async transcribeWavBuffer(arrayBuffer) {
+    const decoded = decodeWav(arrayBuffer);
+    return this.transcribeSamples(decoded.samples, decoded.sampleRate);
+  }
+}
+
 export async function createAsrModel({
   modelType,
   decoderKind,
@@ -647,6 +774,11 @@ export async function createAsrModel({
       "createAsrModel expects modelType and decoderKind.",
     );
   }
+  const configuredSampleRate =
+    Number(config?.feature_extraction_params?.sample_rate)
+    || Number(config?.sample_rate)
+    || 16000;
+
   if (decoderKind === "whisper-ort") {
     if (!whisperModel || !vocabJson) {
       throw new Error("whisper-ort requires whisperModel and vocabJson.");
@@ -716,6 +848,19 @@ export async function createAsrModel({
     });
   }
 
+  if (decoderKind === "tone-ctc") {
+    if (!encoderModel || !vocabularyText) {
+      throw new Error("tone-ctc requires model.onnx and vocabulary.");
+    }
+    const session = await ort.InferenceSession.create(encoderModel, sessionOptions);
+    const tokens = parseVocabulary(vocabularyText);
+    return new ToneCtcModel({
+      config,
+      tokens,
+      session,
+    });
+  }
+
   if (!encoderModel || !vocabularyText) {
     throw new Error("createAsrModel expects encoderModel and vocabularyText for non-whisper models.");
   }
@@ -742,19 +887,26 @@ export async function createAsrModel({
   const maxSymbols = config?.max_tokens_per_step ?? decoderOptions?.maxSymbols ?? 10;
 
   if (decoderKind === "ctc") {
+    const blankTokenId =
+      Number.isInteger(config?.pad_token_id) ? config.pad_token_id : detectBlankTokenId(tokens);
     return new AsrModel({
       preprocessor: preprocessorSession ? new PreprocessorModel(preprocessorSession) : null,
-      encoder: new CtcAcousticModel(encoderSession, { config, sampleRate: 16000, vocabSize: tokens.length }),
+      encoder: new CtcAcousticModel(encoderSession, {
+        config,
+        sampleRate: configuredSampleRate,
+        vocabSize: tokens.length,
+      }),
       decoder: new CtcGreedyDecoder({
         blankTokenId,
       }),
       tokens,
+      sampleRate: configuredSampleRate,
     });
   }
 
   return new AsrModel({
     preprocessor: preprocessorSession ? new PreprocessorModel(preprocessorSession) : null,
-    encoder: new EncoderModel(encoderSession, { config, sampleRate: 16000 }),
+    encoder: new EncoderModel(encoderSession, { config, sampleRate: configuredSampleRate }),
     decoder: new TransducerGreedyDecoder(
       new DecoderTransducerModel(decoderSession, {
         decoderKind,
@@ -767,5 +919,6 @@ export async function createAsrModel({
       },
     ),
     tokens,
+    sampleRate: configuredSampleRate,
   });
 }
