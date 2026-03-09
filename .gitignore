@@ -3,3 +3,4 @@ node_modules/
 *.log
 models
 test.wav
+test_ru.wav

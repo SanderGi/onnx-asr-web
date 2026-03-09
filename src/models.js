@@ -122,6 +122,7 @@ function logMelSpectrogram(samples, options = {}) {
   const fMax = options.fMax ?? sampleRate / 2;
   const logEps = options.logEps ?? 1e-10;
   const preemphasis = options.preemphasis ?? 0.97;
+  const normalize = options.normalize ?? true;
 
   if (preemphasis > 0) {
     const emphasized = new Float32Array(samples.length);
@@ -166,23 +167,25 @@ function logMelSpectrogram(samples, options = {}) {
     }
   }
 
-  // NeMo default behavior uses per-feature normalization.
-  for (let m = 0; m < nMels; m += 1) {
-    const offset = m * frameCount;
-    let mean = 0;
-    for (let t = 0; t < frameCount; t += 1) {
-      mean += features[offset + t];
-    }
-    mean /= frameCount;
+  if (normalize) {
+    // NeMo default behavior uses per-feature normalization.
+    for (let m = 0; m < nMels; m += 1) {
+      const offset = m * frameCount;
+      let mean = 0;
+      for (let t = 0; t < frameCount; t += 1) {
+        mean += features[offset + t];
+      }
+      mean /= frameCount;
 
-    let variance = 0;
-    for (let t = 0; t < frameCount; t += 1) {
-      const delta = features[offset + t] - mean;
-      variance += delta * delta;
-    }
-    const std = Math.sqrt(variance / frameCount) + 1e-5;
-    for (let t = 0; t < frameCount; t += 1) {
-      features[offset + t] = (features[offset + t] - mean) / std;
+      let variance = 0;
+      for (let t = 0; t < frameCount; t += 1) {
+        const delta = features[offset + t] - mean;
+        variance += delta * delta;
+      }
+      const std = Math.sqrt(variance / frameCount) + 1e-5;
+      for (let t = 0; t < frameCount; t += 1) {
+        features[offset + t] = (features[offset + t] - mean) / std;
+      }
     }
   }
 
@@ -245,6 +248,7 @@ export class EncoderModel {
     const nMelsFromShape = this.audioMetadata?.shape?.[1];
     const configNels = this.options.config?.features_size;
     const nMels = Number.isFinite(nMelsFromShape) ? nMelsFromShape : configNels ?? 80;
+    const isGigaam = this.options.config?.model_type === "gigaam";
     const mel = logMelSpectrogram(samples, {
       sampleRate: this.options.sampleRate ?? 16000,
       nMels,
@@ -252,6 +256,8 @@ export class EncoderModel {
       nFft: 512,
       winLength: 400,
       hopLength: 160,
+      preemphasis: isGigaam ? 0 : 0.97,
+      normalize: !isGigaam,
     });
 
     const audioTensor = new ort.Tensor("float32", mel.features, [1, mel.nMels, mel.frameCount]);

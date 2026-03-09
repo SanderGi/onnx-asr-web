@@ -27,6 +27,13 @@ export const MODEL_TYPES = {
     decoderJoint: "decoder-model.onnx",
     vocabCandidates: ["vocab.txt", "tokens.txt"],
   },
+  gigaam: {
+    decoderKind: "gigaam",
+    preprocessor: null,
+    encoder: null,
+    decoderJoint: null,
+    vocabCandidates: ["v3_vocab.txt", "v2_vocab.txt", "vocab.txt", "tokens.txt"],
+  },
   "whisper-ort": {
     decoderKind: "whisper-ort",
     preprocessor: null,

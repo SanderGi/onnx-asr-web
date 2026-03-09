@@ -58,24 +58,12 @@ async function resolveModelUrl(baseUrl, filename, options) {
 
   for (const candidate of candidates) {
     const url = joinUrl(baseUrl, candidate);
-    const exists = await probeUrl(url, fetchImpl, headers);
-    if (exists) {
+    if (await probeUrl(url, fetchImpl, headers)) {
       return url;
     }
   }
 
   return joinUrl(baseUrl, candidates[candidates.length - 1]);
-}
-
-async function fetchFirstExistingText(baseUrl, candidates, fetchImpl, headers) {
-  for (const candidate of candidates) {
-    const url = joinUrl(baseUrl, candidate);
-    const exists = await probeUrl(url, fetchImpl, headers);
-    if (exists) {
-      return fetchText(url, fetchImpl, headers);
-    }
-  }
-  throw new Error(`Missing file. Checked: ${candidates.join(", ")}`);
 }
 
 async function resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers) {
@@ -86,6 +74,11 @@ async function resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers) 
     }
   }
   throw new Error(`Missing file. Checked: ${candidates.join(", ")}`);
+}
+
+async function fetchFirstExistingText(baseUrl, candidates, fetchImpl, headers) {
+  const url = await resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers);
+  return fetchText(url, fetchImpl, headers);
 }
 
 async function listHuggingFaceRepoFiles(repoId, revision, endpoint, fetchImpl, headers) {
@@ -113,6 +106,63 @@ function pickWhisperBeamsearchFile(files, quantization) {
   return list.find((name) => !/(?:\.int8|_int8)\.onnx$/.test(name)) ?? list[0];
 }
 
+async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, headers) {
+  const version = config.version ?? "v2";
+  const vocabName = `${version}_vocab.txt`;
+  const vocab = await fetchFirstExistingText(baseUrl, [vocabName, "vocab.txt", "tokens.txt"], fetchImpl, headers);
+
+  const rnntPrefixes = [`${version}_rnnt`, `${version}_e2e_rnnt`];
+  for (const prefix of rnntPrefixes) {
+    const encoder = await resolveFirstExistingUrl(
+      baseUrl,
+      modelFilenameCandidates(`${prefix}_encoder.onnx`, quantization),
+      fetchImpl,
+      headers,
+    ).catch(() => null);
+    const decoder = await resolveFirstExistingUrl(
+      baseUrl,
+      modelFilenameCandidates(`${prefix}_decoder.onnx`, quantization),
+      fetchImpl,
+      headers,
+    ).catch(() => null);
+    const joint = await resolveFirstExistingUrl(
+      baseUrl,
+      modelFilenameCandidates(`${prefix}_joint.onnx`, quantization),
+      fetchImpl,
+      headers,
+    ).catch(() => null);
+
+    if (encoder && decoder && joint) {
+      return {
+        mode: "rnnt",
+        encoder,
+        decoder,
+        joint,
+        vocabularyText: vocab,
+      };
+    }
+  }
+
+  const ctcCandidates = [`${version}_ctc.onnx`, `${version}_e2e_ctc.onnx`];
+  for (const candidate of ctcCandidates) {
+    const model = await resolveFirstExistingUrl(
+      baseUrl,
+      modelFilenameCandidates(candidate, quantization),
+      fetchImpl,
+      headers,
+    ).catch(() => null);
+    if (model) {
+      return {
+        mode: "ctc",
+        ctcModel: model,
+        vocabularyText: vocab,
+      };
+    }
+  }
+
+  throw new Error("Could not resolve GigaAM RNNT or CTC model files.");
+}
+
 export async function loadLocalModel(baseUrl, options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
@@ -134,10 +184,9 @@ export async function loadLocalModel(baseUrl, options = {}) {
     const whisperModel = await resolveFirstExistingUrl(baseUrl, modelCandidates, fetchImpl, headers);
 
     const vocabJson = await fetchText(joinUrl(baseUrl, "vocab.json"), fetchImpl, headers);
-    let addedTokensJson = "{}";
-    if (await probeUrl(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)) {
-      addedTokensJson = await fetchText(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers);
-    }
+    const addedTokensJson = await probeUrl(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)
+      ? await fetchText(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)
+      : "{}";
 
     return createAsrModel({
       modelType,
@@ -158,9 +207,6 @@ export async function loadLocalModel(baseUrl, options = {}) {
       fetchText(joinUrl(baseUrl, "vocab.json"), fetchImpl, headers),
       probeUrl(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers),
     ]);
-    const addedTokensJson = hasAddedTokens
-      ? await fetchText(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)
-      : "{}";
 
     return createAsrModel({
       modelType,
@@ -169,7 +215,36 @@ export async function loadLocalModel(baseUrl, options = {}) {
       encoderModel,
       decoderJointModel,
       vocabJson,
-      addedTokensJson,
+      addedTokensJson: hasAddedTokens
+        ? await fetchText(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)
+        : "{}",
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
+
+  if (spec.decoderKind === "gigaam") {
+    const artifacts = await resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, headers);
+    if (artifacts.mode === "rnnt") {
+      return createAsrModel({
+        modelType,
+        decoderKind: "gigaam-rnnt",
+        config,
+        encoderModel: artifacts.encoder,
+        decoderModel: artifacts.decoder,
+        decoderJointModel: artifacts.joint,
+        vocabularyText: artifacts.vocabularyText,
+        sessionOptions: options.sessionOptions,
+        decoderOptions: options.decoderOptions,
+      });
+    }
+
+    return createAsrModel({
+      modelType,
+      decoderKind: "ctc",
+      config,
+      encoderModel: artifacts.ctcModel,
+      vocabularyText: artifacts.vocabularyText,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
     });

@@ -202,11 +202,94 @@ async function resolveWhisperLocalArtifacts(modelDir, quantization) {
   return { beamsearch, vocabPath, addedTokensPath };
 }
 
+function pickGigaamVersion(config, files) {
+  if (config.version) {
+    return String(config.version);
+  }
+  if (files.some((name) => name.startsWith("v3_"))) {
+    return "v3";
+  }
+  if (files.some((name) => name.startsWith("v2_"))) {
+    return "v2";
+  }
+  return "v2";
+}
+
+function selectGigaamArtifacts(config, files, quantization) {
+  const version = pickGigaamVersion(config, files);
+  const preferPrefixes = [`${version}_rnnt`, `${version}_e2e_rnnt`];
+
+  for (const prefix of preferPrefixes) {
+    const encoder = pickQuantizedByPattern(files, new RegExp(`^${prefix}_encoder(?:\\.int8)?\\.onnx$`), quantization);
+    const decoder = pickQuantizedByPattern(files, new RegExp(`^${prefix}_decoder(?:\\.int8)?\\.onnx$`), quantization);
+    const joint = pickQuantizedByPattern(files, new RegExp(`^${prefix}_joint(?:\\.int8)?\\.onnx$`), quantization);
+    if (encoder && decoder && joint) {
+      return {
+        mode: "rnnt",
+        version,
+        encoder,
+        decoder,
+        joint,
+        vocab: `${version}_vocab.txt`,
+      };
+    }
+  }
+
+  const ctcCandidates = [`${version}_ctc.onnx`, `${version}_e2e_ctc.onnx`];
+  for (const base of ctcCandidates) {
+    const stem = base.replace(/\.onnx$/, "");
+    const model = pickQuantizedByPattern(files, new RegExp(`^${stem}(?:\\.int8)?\\.onnx$`), quantization);
+    if (model) {
+      return {
+        mode: "ctc",
+        version,
+        ctcModel: model,
+        vocab: `${version}_vocab.txt`,
+      };
+    }
+  }
+
+  throw new Error("Could not resolve GigaAM artifacts (RNNT or CTC) from local files.");
+}
+
 export async function loadLocalModel(modelDir, options = {}) {
   const quantization = options.quantization ?? "int8";
   const configText = await readFile(join(modelDir, "config.json"), "utf8");
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
+
+  if (spec.decoderKind === "gigaam") {
+    const files = await walkFiles(modelDir);
+    const artifacts = selectGigaamArtifacts(config, files, quantization);
+    const vocabPath = files.includes(artifacts.vocab) ? artifacts.vocab : (files.includes("vocab.txt") ? "vocab.txt" : null);
+    if (!vocabPath) {
+      throw new Error("GigaAM vocabulary file not found.");
+    }
+
+    if (artifacts.mode === "rnnt") {
+      return createAsrModel({
+        modelType,
+        decoderKind: "gigaam-rnnt",
+        config,
+        encoderModel: join(modelDir, artifacts.encoder),
+        decoderModel: join(modelDir, artifacts.decoder),
+        decoderJointModel: join(modelDir, artifacts.joint),
+        vocabularyText: await readFile(join(modelDir, vocabPath), "utf8"),
+        sessionOptions: options.sessionOptions,
+        decoderOptions: options.decoderOptions,
+      });
+    }
+
+    return createAsrModel({
+      modelType,
+      decoderKind: "ctc",
+      config,
+      encoderModel: join(modelDir, artifacts.ctcModel),
+      vocabularyText: await readFile(join(modelDir, vocabPath), "utf8"),
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
 
   if (spec.decoderKind === "whisper-ort") {
     const artifacts = await resolveWhisperLocalArtifacts(modelDir, quantization);
@@ -310,6 +393,27 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
       await downloadPath(baseUrl, modelDir, "added_tokens.json", requestOptions, { required: true });
     }
 
+    return modelDir;
+  }
+
+  if (spec.decoderKind === "gigaam") {
+    const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+    const artifacts = selectGigaamArtifacts(config, [...repoFiles], quantization);
+    const downloadList = artifacts.mode === "rnnt"
+      ? [artifacts.encoder, artifacts.decoder, artifacts.joint]
+      : [artifacts.ctcModel];
+
+    for (const file of downloadList) {
+      if (options.forceDownload || !(await fileExists(join(modelDir, file)))) {
+        await downloadPath(baseUrl, modelDir, file, requestOptions, { required: true });
+      }
+      await ensureSidecars(baseUrl, modelDir, file, requestOptions, repoFiles);
+    }
+
+    const vocab = repoFiles.has(artifacts.vocab) ? artifacts.vocab : "vocab.txt";
+    if (options.forceDownload || !(await fileExists(join(modelDir, vocab)))) {
+      await downloadPath(baseUrl, modelDir, vocab, requestOptions, { required: true });
+    }
     return modelDir;
   }
 
