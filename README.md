@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="onnx-asr-web logo" width="100"/>
+  <img src="https://raw.githubusercontent.com/SanderGi/onnx-asr-web/main/logo.png" alt="onnx-asr-web logo" width="100"/>
 </p>
 
 # onnx-asr-web
