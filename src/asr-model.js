@@ -1,6 +1,8 @@
 import * as ort from "onnxruntime-web";
 import { decodeWav, normalize, resampleLinear } from "./audio.js";
 import {
+  CtcAcousticModel,
+  CtcGreedyDecoder,
   DecoderTransducerModel,
   EncoderModel,
   PreprocessorModel,
@@ -195,16 +197,19 @@ export async function createAsrModel({
   sessionOptions,
   decoderOptions,
 } = {}) {
-  if (!modelType || !decoderKind || !encoderModel || !decoderJointModel || !vocabularyText) {
+  if (!modelType || !decoderKind || !encoderModel || !vocabularyText) {
     throw new Error(
-      "createAsrModel expects modelType, decoderKind, encoderModel, decoderJointModel, and vocabularyText.",
+      "createAsrModel expects modelType, decoderKind, encoderModel, and vocabularyText.",
     );
   }
+  if (decoderKind !== "ctc" && !decoderJointModel) {
+    throw new Error("Transducer models require decoderJointModel.");
+  }
 
-  const sessionPromises = [
-    ort.InferenceSession.create(encoderModel, sessionOptions),
-    ort.InferenceSession.create(decoderJointModel, sessionOptions),
-  ];
+  const sessionPromises = [ort.InferenceSession.create(encoderModel, sessionOptions)];
+  if (decoderJointModel) {
+    sessionPromises.push(ort.InferenceSession.create(decoderJointModel, sessionOptions));
+  }
 
   if (preprocessorModel) {
     sessionPromises.unshift(ort.InferenceSession.create(preprocessorModel, sessionOptions));
@@ -218,6 +223,17 @@ export async function createAsrModel({
   const tokens = parseVocabulary(vocabularyText);
   const blankTokenId = detectBlankTokenId(tokens);
   const maxSymbols = config?.max_tokens_per_step ?? decoderOptions?.maxSymbols ?? 10;
+
+  if (decoderKind === "ctc") {
+    return new AsrModel({
+      preprocessor: preprocessorSession ? new PreprocessorModel(preprocessorSession) : null,
+      encoder: new CtcAcousticModel(encoderSession, { config, sampleRate: 16000, vocabSize: tokens.length }),
+      decoder: new CtcGreedyDecoder({
+        blankTokenId,
+      }),
+      tokens,
+    });
+  }
 
   return new AsrModel({
     preprocessor: preprocessorSession ? new PreprocessorModel(preprocessorSession) : null,

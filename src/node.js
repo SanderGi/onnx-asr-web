@@ -131,7 +131,9 @@ export async function loadLocalModel(modelDir, options = {}) {
   const { modelType, spec } = detectModelType(config);
 
   const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
-  const decoderFile = await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization);
+  const decoderFile = spec.decoderJoint
+    ? await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization)
+    : null;
   const preprocessorFile = spec.preprocessor
     ? await selectOrFallbackModelFile(modelDir, spec.preprocessor, quantization)
     : null;
@@ -143,7 +145,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     config,
     preprocessorModel: preprocessorFile ? join(modelDir, preprocessorFile) : null,
     encoderModel: join(modelDir, encoderFile),
-    decoderJointModel: join(modelDir, decoderFile),
+    decoderJointModel: decoderFile ? join(modelDir, decoderFile) : null,
     vocabularyText: vocabulary.text,
     sessionOptions: options.sessionOptions,
     decoderOptions: options.decoderOptions,
@@ -178,7 +180,7 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
   const config = parseConfigText(await readFile(configPath, "utf8"));
   const { spec } = detectModelType(config);
 
-  const modelFiles = [spec.encoder, spec.decoderJoint, ...(spec.preprocessor ? [spec.preprocessor] : [])];
+  const modelFiles = [spec.encoder, ...(spec.decoderJoint ? [spec.decoderJoint] : []), ...(spec.preprocessor ? [spec.preprocessor] : [])];
 
   for (const filename of modelFiles) {
     const candidates = modelFilenameCandidates(filename, quantization);

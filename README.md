@@ -8,6 +8,7 @@ Detected automatically from `config.json`:
 
 - `nemo-conformer-tdt`
 - `nemo-conformer-rnnt`
+- `nemo-conformer-ctc`
 
 ## Install
 
@@ -59,6 +60,7 @@ console.log(result.words); // [{word, start, end}] in seconds
 
 - TDT (`nemo-conformer-tdt`): `nemo128.onnx`, `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt` or `tokens.txt`
 - RNNT (`nemo-conformer-rnnt`): `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt` or `tokens.txt`
+- CTC (`nemo-conformer-ctc`): `model.onnx` and `vocab.txt` or `tokens.txt`
 
 When quantization is enabled (`quantization: "int8"`), `*.int8.onnx` is preferred.
 

@@ -284,6 +284,54 @@ export class EncoderModel {
   }
 }
 
+export class CtcAcousticModel extends EncoderModel {
+  constructor(session, options = {}) {
+    super(session, options);
+    this.vocabSize = options.vocabSize;
+  }
+
+  async run(processedSignalTensor, processedLengthTensor) {
+    const outputs = await this.session.run({
+      [this.audioSignalName]: processedSignalTensor,
+      [this.lengthName]: processedLengthTensor,
+    });
+
+    const logits = ensureOutput(this.session, outputs, 0);
+    const lengthTensor = this.session.outputNames.length > 1 ? outputs[this.session.outputNames[1]] : null;
+    if (logits.dims.length !== 3) {
+      throw new Error(
+        `Unexpected CTC output shape: [${logits.dims.join(", ")}]. Expected rank-3 [1, T, V] or [1, V, T].`,
+      );
+    }
+
+    let d1;
+    let d2;
+    if (logits.dims[0] === 1) {
+      d1 = logits.dims[1];
+      d2 = logits.dims[2];
+    } else if (logits.dims[1] === 1) {
+      d1 = logits.dims[0];
+      d2 = logits.dims[2];
+    } else {
+      throw new Error(`Unexpected CTC batch layout: [${logits.dims.join(", ")}].`);
+    }
+
+    let layout = "BTV";
+    if (this.vocabSize && d1 === this.vocabSize && d2 !== this.vocabSize) {
+      layout = "BVT";
+    } else if (this.vocabSize && d2 === this.vocabSize) {
+      layout = "BTV";
+    }
+
+    return {
+      encodedData: logits.data,
+      encodedDims: [1, d1, d2],
+      encodedLayout: layout,
+      encodedLength: lengthTensor ? readScalarInt(lengthTensor) : (layout === "BVT" ? d2 : d1),
+    };
+  }
+}
+
 export class DecoderTransducerModel {
   constructor(session, options = {}) {
     this.session = session;
@@ -497,6 +545,71 @@ export class TransducerGreedyDecoder {
         tokenFrames[emissionIndex].endFrame = nextT;
       }
       t = nextT;
+    }
+
+    return { tokenIds, tokenFrames, totalFrames: limit };
+  }
+}
+
+export class CtcGreedyDecoder {
+  constructor(options = {}) {
+    this.blankTokenId = options.blankTokenId ?? 0;
+  }
+
+  argmaxAt(data, start, size) {
+    let best = 0;
+    let bestValue = -Infinity;
+    for (let i = 0; i < size; i += 1) {
+      const value = data[start + i];
+      if (value > bestValue) {
+        bestValue = value;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  async decode(encodedData, encodedDims, encodedLayout, encodedLength) {
+    const tokenIds = [];
+    const tokenFrames = [];
+    let previous = this.blankTokenId;
+
+    const timeSteps = encodedLayout === "BVT" ? encodedDims[2] : encodedDims[1];
+    const vocabSize = encodedLayout === "BVT" ? encodedDims[1] : encodedDims[2];
+    const limit = Math.min(encodedLength, timeSteps);
+
+    for (let t = 0; t < limit; t += 1) {
+      let token;
+      if (encodedLayout === "BVT") {
+        let best = 0;
+        let bestValue = -Infinity;
+        for (let v = 0; v < vocabSize; v += 1) {
+          const value = encodedData[v * timeSteps + t];
+          if (value > bestValue) {
+            bestValue = value;
+            best = v;
+          }
+        }
+        token = best;
+      } else {
+        token = this.argmaxAt(encodedData, t * vocabSize, vocabSize);
+      }
+
+      if (token === this.blankTokenId) {
+        previous = this.blankTokenId;
+        continue;
+      }
+      if (token === previous) {
+        const last = tokenFrames[tokenFrames.length - 1];
+        if (last) {
+          last.endFrame = t + 1;
+        }
+        continue;
+      }
+
+      tokenIds.push(token);
+      tokenFrames.push({ startFrame: t, endFrame: t + 1 });
+      previous = token;
     }
 
     return { tokenIds, tokenFrames, totalFrames: limit };

@@ -13,6 +13,13 @@ export const MODEL_TYPES = {
     decoderJoint: "decoder_joint-model.onnx",
     vocabCandidates: ["vocab.txt", "tokens.txt"],
   },
+  "nemo-conformer-ctc": {
+    decoderKind: "ctc",
+    preprocessor: null,
+    encoder: "model.onnx",
+    decoderJoint: null,
+    vocabCandidates: ["vocab.txt", "tokens.txt"],
+  },
 };
 
 export function parseConfigText(configText) {

@@ -30,8 +30,8 @@ function printUsage() {
   console.log("");
   console.log("Expected model files in model dir/cache:");
   console.log("  config.json");
-  console.log("  encoder-model.onnx");
-  console.log("  decoder_joint-model.onnx");
+  console.log("  encoder-model.onnx + decoder_joint-model.onnx (RNNT/TDT)");
+  console.log("  or model.onnx (CTC)");
   console.log("  vocab.txt or tokens.txt");
   console.log("  optional: nemo128.onnx (required for nemo-conformer-tdt)");
   console.log("");

@@ -92,7 +92,9 @@ export async function loadLocalModel(baseUrl, options = {}) {
 
   const [encoderModel, decoderJointModel, vocabularyText, preprocessorModel] = await Promise.all([
     resolveModelUrl(baseUrl, spec.encoder, { fetchImpl, headers, quantization }),
-    resolveModelUrl(baseUrl, spec.decoderJoint, { fetchImpl, headers, quantization }),
+    spec.decoderJoint
+      ? resolveModelUrl(baseUrl, spec.decoderJoint, { fetchImpl, headers, quantization })
+      : Promise.resolve(null),
     fetchFirstExistingText(baseUrl, spec.vocabCandidates, fetchImpl, headers),
     spec.preprocessor
       ? resolveModelUrl(baseUrl, spec.preprocessor, { fetchImpl, headers, quantization })
