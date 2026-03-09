@@ -174,6 +174,37 @@ async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, h
   throw new Error("Could not resolve GigaAM RNNT or CTC model files.");
 }
 
+async function resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, headers) {
+  const encoder = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates("encoder-model.onnx", quantization),
+    fetchImpl,
+    headers,
+  ).catch(() => null);
+  const decoderJoint = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates("decoder_joint-model.onnx", quantization),
+    fetchImpl,
+    headers,
+  ).catch(() => null);
+
+  if (encoder && decoderJoint) {
+    return { mode: "rnnt", encoder, decoderJoint };
+  }
+
+  const ctcModel = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates("model.onnx", quantization),
+    fetchImpl,
+    headers,
+  ).catch(() => null);
+  if (ctcModel) {
+    return { mode: "ctc", ctcModel };
+  }
+
+  throw new Error("Could not resolve nemo-conformer RNNT or CTC artifacts.");
+}
+
 export async function loadLocalModel(baseUrl, options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
@@ -256,6 +287,34 @@ export async function loadLocalModel(baseUrl, options = {}) {
       config,
       encoderModel: artifacts.ctcModel,
       vocabularyText: artifacts.vocabularyText,
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
+
+  if (spec.decoderKind === "nemo-conformer") {
+    const artifacts = await resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, headers);
+    const vocabularyText = await fetchFirstExistingText(baseUrl, spec.vocabCandidates, fetchImpl, headers);
+
+    if (artifacts.mode === "rnnt") {
+      return createAsrModel({
+        modelType,
+        decoderKind: "rnnt",
+        config,
+        encoderModel: artifacts.encoder,
+        decoderJointModel: artifacts.decoderJoint,
+        vocabularyText,
+        sessionOptions: options.sessionOptions,
+        decoderOptions: options.decoderOptions,
+      });
+    }
+
+    return createAsrModel({
+      modelType,
+      decoderKind: "ctc",
+      config,
+      encoderModel: artifacts.ctcModel,
+      vocabularyText,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
     });

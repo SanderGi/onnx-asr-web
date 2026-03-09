@@ -263,11 +263,55 @@ function selectGigaamArtifacts(config, files, quantization) {
   throw new Error("Could not resolve GigaAM artifacts (RNNT or CTC) from local files.");
 }
 
+function selectNemoConformerArtifacts(files, quantization) {
+  const encoder = pickQuantizedByPattern(files, /^encoder-model(?:\.int8)?\.onnx$/, quantization);
+  const decoderJoint = pickQuantizedByPattern(files, /^decoder_joint-model(?:\.int8)?\.onnx$/, quantization);
+  if (encoder && decoderJoint) {
+    return { mode: "rnnt", encoder, decoderJoint };
+  }
+
+  const ctcModel = pickQuantizedByPattern(files, /^model(?:\.int8)?\.onnx$/, quantization);
+  if (ctcModel) {
+    return { mode: "ctc", ctcModel };
+  }
+
+  throw new Error("Could not resolve nemo-conformer artifacts (RNNT or CTC).");
+}
+
 export async function loadLocalModel(modelDir, options = {}) {
   const quantization = options.quantization ?? "int8";
   const configText = await readFile(join(modelDir, "config.json"), "utf8");
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
+
+  if (spec.decoderKind === "nemo-conformer") {
+    const files = await walkFiles(modelDir);
+    const artifacts = selectNemoConformerArtifacts(files, quantization);
+    const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
+
+    if (artifacts.mode === "rnnt") {
+      return createAsrModel({
+        modelType,
+        decoderKind: "rnnt",
+        config,
+        encoderModel: join(modelDir, artifacts.encoder),
+        decoderJointModel: join(modelDir, artifacts.decoderJoint),
+        vocabularyText: vocabulary.text,
+        sessionOptions: options.sessionOptions,
+        decoderOptions: options.decoderOptions,
+      });
+    }
+
+    return createAsrModel({
+      modelType,
+      decoderKind: "ctc",
+      config,
+      encoderModel: join(modelDir, artifacts.ctcModel),
+      vocabularyText: vocabulary.text,
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
 
   if (spec.decoderKind === "gigaam") {
     const files = await walkFiles(modelDir);
@@ -393,6 +437,28 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
 
   const config = parseConfigText(await readFile(configPath, "utf8"));
   const { spec } = detectModelType(config);
+
+  if (spec.decoderKind === "nemo-conformer") {
+    const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+    const artifacts = selectNemoConformerArtifacts([...repoFiles], quantization);
+    const downloadList = artifacts.mode === "rnnt"
+      ? [artifacts.encoder, artifacts.decoderJoint]
+      : [artifacts.ctcModel];
+
+    for (const file of downloadList) {
+      if (options.forceDownload || !(await fileExists(join(modelDir, file)))) {
+        await downloadPath(baseUrl, modelDir, file, requestOptions, { required: true });
+      }
+      await ensureSidecars(baseUrl, modelDir, file, requestOptions, repoFiles);
+    }
+
+    const vocabulary = await selectExistingFile(modelDir, ["vocab.txt", "tokens.txt"]);
+    if (!vocabulary || options.forceDownload) {
+      const vocabFile = repoFiles.has("vocab.txt") ? "vocab.txt" : "tokens.txt";
+      await downloadPath(baseUrl, modelDir, vocabFile, requestOptions, { required: true });
+    }
+    return modelDir;
+  }
 
   if (spec.decoderKind === "whisper-ort") {
     const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);

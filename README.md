@@ -10,6 +10,7 @@ Detected automatically from `config.json`:
 - `nemo-conformer-rnnt`
 - `nemo-conformer-ctc`
 - `nemo-conformer-aed`
+- `nemo-conformer`
 - `gigaam` (v2/v3)
 - `tone-ctc`
 - `whisper-ort`
@@ -67,6 +68,7 @@ console.log(result.words); // [{word, start, end}] in seconds
 - RNNT (`nemo-conformer-rnnt`): `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt` or `tokens.txt`
 - CTC (`nemo-conformer-ctc`): `model.onnx` and `vocab.txt` or `tokens.txt`
 - Canary AED (`nemo-conformer-aed`): `encoder-model.onnx`, `decoder-model.onnx`, and `vocab.txt` or `tokens.txt`
+- FastConformer (`nemo-conformer`): prefers RNNT split (`encoder-model.onnx` + `decoder_joint-model.onnx`) and falls back to CTC `model.onnx`, with `vocab.txt` or `tokens.txt`
 - GigaAM (`gigaam`): auto-detects `v2_*`/`v3_*` files, prefers RNNT triplet (`*_rnnt_encoder/decoder/joint`) and falls back to CTC (`*_ctc.onnx`), with `v2_vocab.txt`/`v3_vocab.txt`
 - Tone CTC (`tone-ctc`): `model.onnx` with vocab from `decoder_params.vocabulary` in `config.json` (or `vocab.json`)
 - Whisper ORT (`whisper-ort`): `*_beamsearch.onnx` model, plus `vocab.json` (and optionally `added_tokens.json`)

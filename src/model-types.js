@@ -27,6 +27,13 @@ export const MODEL_TYPES = {
     decoderJoint: "decoder-model.onnx",
     vocabCandidates: ["vocab.txt", "tokens.txt"],
   },
+  "nemo-conformer": {
+    decoderKind: "nemo-conformer",
+    preprocessor: null,
+    encoder: "encoder-model.onnx",
+    decoderJoint: "decoder_joint-model.onnx",
+    vocabCandidates: ["vocab.txt", "tokens.txt"],
+  },
   gigaam: {
     decoderKind: "gigaam",
     preprocessor: null,
