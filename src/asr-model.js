@@ -754,6 +754,254 @@ export class ToneCtcModel {
   }
 }
 
+export class SherpaTransducerModel {
+  constructor({ config, tokens, encoderSession, decoderSession, joinerSession }) {
+    this.config = config ?? {};
+    this.tokens = tokens;
+    this.encoderSession = encoderSession;
+    this.decoderSession = decoderSession;
+    this.joinerSession = joinerSession;
+
+    this.sampleRate = Number(this.config.sample_rate) || 16000;
+    this.blankTokenId = detectBlankTokenId(tokens);
+    this.maxSymbolsPerFrame = this.config.max_tokens_per_step ?? 10;
+
+    this.encoderInputName = encoderSession.inputNames[0];
+    this.encoderLengthName = encoderSession.inputNames.length > 1 ? encoderSession.inputNames[1] : null;
+    this.encoderInputMeta = metaForName(encoderSession, this.encoderInputName);
+    this.encoderLengthMeta = this.encoderLengthName ? metaForName(encoderSession, this.encoderLengthName) : null;
+    this.encoderOutputName = encoderSession.outputNames[0];
+    this.encoderLengthOutName = encoderSession.outputNames.length > 1 ? encoderSession.outputNames[1] : null;
+
+    this.decoderInputName = decoderSession.inputNames[0];
+    this.decoderInputMeta = metaForName(decoderSession, this.decoderInputName);
+    this.decoderOutputName = decoderSession.outputNames[0];
+    const contextDim = this.decoderInputMeta?.shape?.[1];
+    this.contextSize = typeof contextDim === "number" && contextDim > 0 ? contextDim : 1;
+    this.decoderInputType = this.decoderInputMeta?.type ?? "int64";
+
+    this.joinerEncName = joinerSession.inputNames[0];
+    this.joinerDecName = joinerSession.inputNames[1];
+    this.joinerOutputName = joinerSession.outputNames[0];
+    this.joinerEncShape = metaForName(joinerSession, this.joinerEncName)?.shape ?? [1, 1, 1];
+    this.joinerDecShape = metaForName(joinerSession, this.joinerDecName)?.shape ?? [1, 1, 1];
+
+    this.encoderFeatureConfig = {
+      model_type: "sherpa-transducer",
+      features_size: Number(this.encoderInputMeta?.shape?.[1]) || 80,
+      feature_extraction_params: {
+        sample_rate: this.sampleRate,
+        n_mels: Number(this.encoderInputMeta?.shape?.[1]) || 80,
+        n_fft: 400,
+        window_size: 0.025,
+        window_stride: 0.01,
+        preemphasis_coefficient: 0.97,
+      },
+    };
+    this.encoderHelper = new EncoderModel(encoderSession, {
+      config: this.encoderFeatureConfig,
+      sampleRate: this.sampleRate,
+    });
+  }
+
+  adaptTensorToShape(tensor, targetShape) {
+    if (!Array.isArray(targetShape)) {
+      return tensor;
+    }
+
+    if (targetShape.length !== tensor.dims.length) {
+      // Common sherpa exports use either [B, D] or [B, 1, D]/[B, D, 1].
+      if (tensor.dims.length === 3 && targetShape.length === 2 && tensor.dims[0] === 1) {
+        const flat = Float32Array.from(tensor.data);
+        if (tensor.dims[1] === 1) {
+          return new ort.Tensor("float32", flat, [1, tensor.dims[2]]);
+        }
+        if (tensor.dims[2] === 1) {
+          return new ort.Tensor("float32", flat, [1, tensor.dims[1]]);
+        }
+      }
+      if (tensor.dims.length === 2 && targetShape.length === 3 && tensor.dims[0] === 1) {
+        const d = tensor.dims[1];
+        if (targetShape[1] === 1 || targetShape[2] === d) {
+          return new ort.Tensor("float32", Float32Array.from(tensor.data), [1, 1, d]);
+        }
+        return new ort.Tensor("float32", Float32Array.from(tensor.data), [1, d, 1]);
+      }
+      return tensor;
+    }
+
+    if (tensor.dims.every((d, i) => typeof targetShape[i] !== "number" || targetShape[i] < 0 || d === targetShape[i])) {
+      return tensor;
+    }
+
+    if (tensor.dims.length === 3 && tensor.dims[1] === targetShape[2] && tensor.dims[2] === targetShape[1]) {
+      const [b, d1, d2] = tensor.dims;
+      const out = new Float32Array(b * d2 * d1);
+      for (let bi = 0; bi < b; bi += 1) {
+        for (let i = 0; i < d1; i += 1) {
+          for (let j = 0; j < d2; j += 1) {
+            out[bi * d2 * d1 + j * d1 + i] = tensor.data[bi * d1 * d2 + i * d2 + j];
+          }
+        }
+      }
+      return new ort.Tensor("float32", out, [b, d2, d1]);
+    }
+
+    return tensor;
+  }
+
+  makeDecoderInput(context) {
+    return intTensorFor(this.decoderInputType, context, [1, this.contextSize]);
+  }
+
+  async runEncoder(samples) {
+    const inputRank = this.encoderInputMeta?.shape?.length ?? 2;
+    if (inputRank === 2) {
+      const signal = new ort.Tensor("float32", samples, [1, samples.length]);
+      const lenType = this.encoderLengthMeta?.type ?? "int64";
+      const length = intTensorFor(lenType, [samples.length], [1]);
+      const outputs = await this.encoderSession.run({
+        [this.encoderInputName]: signal,
+        ...(this.encoderLengthName ? { [this.encoderLengthName]: length } : {}),
+      });
+      return outputs;
+    }
+
+    const prepared = this.encoderHelper.prepareInputsFromWaveform(samples);
+    let signal = prepared.signal;
+
+    const inputShape = this.encoderInputMeta?.shape ?? [];
+    if (signal.dims.length === 3 && inputShape.length === 3) {
+      const featureBins = signal.dims[1];
+      const secondDim = inputShape[1];
+      const thirdDim = inputShape[2];
+      const expectsBtf = typeof thirdDim === "number" && thirdDim === featureBins && secondDim !== featureBins;
+      if (expectsBtf) {
+        const time = signal.dims[2];
+        const transposed = new Float32Array(time * featureBins);
+        for (let f = 0; f < featureBins; f += 1) {
+          for (let t = 0; t < time; t += 1) {
+            transposed[t * featureBins + f] = signal.data[f * time + t];
+          }
+        }
+        signal = new ort.Tensor("float32", transposed, [1, time, featureBins]);
+      }
+    }
+
+    const outputs = await this.encoderSession.run({
+      [this.encoderInputName]: signal,
+      ...(this.encoderLengthName ? { [this.encoderLengthName]: prepared.length } : {}),
+    });
+    return outputs;
+  }
+
+  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+    let prepared = samples;
+    if (!(prepared instanceof Float32Array)) {
+      prepared = Float32Array.from(prepared);
+    }
+    if (sampleRate !== this.sampleRate) {
+      prepared = resampleLinear(prepared, sampleRate, this.sampleRate);
+    }
+
+    const encoderOutputs = await this.runEncoder(prepared);
+    const enc = encoderOutputs[this.encoderOutputName];
+    const encLen = this.encoderLengthOutName ? encoderOutputs[this.encoderLengthOutName] : null;
+    if (!enc) {
+      throw new Error("Sherpa encoder output is missing.");
+    }
+
+    let channels;
+    let time;
+    let bctData;
+    if (enc.dims.length !== 3) {
+      throw new Error(`Unexpected Sherpa encoder output shape: [${enc.dims.join(", ")}].`);
+    }
+    if (enc.dims[0] !== 1) {
+      throw new Error(`Sherpa transducer currently expects batch=1, got ${enc.dims[0]}.`);
+    }
+
+    // normalize to BCT layout
+    if (typeof this.joinerEncShape?.[1] === "number" && enc.dims[1] === this.joinerEncShape[1]) {
+      channels = enc.dims[1];
+      time = enc.dims[2];
+      bctData = enc.data;
+    } else {
+      // assume BTC
+      time = enc.dims[1];
+      channels = enc.dims[2];
+      bctData = new Float32Array(channels * time);
+      for (let t = 0; t < time; t += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          bctData[c * time + t] = enc.data[t * channels + c];
+        }
+      }
+    }
+
+    const encodedLength = encLen
+      ? Number(Array.from(encLen.data, (v) => (typeof v === "bigint" ? Number(v) : v))[0])
+      : time;
+    const limit = Math.min(time, encodedLength);
+
+    const tokenIds = [];
+    const tokenFrames = [];
+    const context = new Array(this.contextSize).fill(this.blankTokenId);
+
+    for (let t = 0; t < limit; t += 1) {
+      const frame = new Float32Array(channels);
+      for (let c = 0; c < channels; c += 1) {
+        frame[c] = bctData[c * time + t];
+      }
+      let encTensor = new ort.Tensor("float32", frame, [1, channels, 1]);
+      encTensor = this.adaptTensorToShape(encTensor, this.joinerEncShape);
+
+      for (let n = 0; n < this.maxSymbolsPerFrame; n += 1) {
+        const decOutputs = await this.decoderSession.run({
+          [this.decoderInputName]: this.makeDecoderInput(context),
+        });
+        let decTensor = decOutputs[this.decoderOutputName];
+        if (!decTensor) {
+          throw new Error("Sherpa decoder output is missing.");
+        }
+        decTensor = this.adaptTensorToShape(decTensor, this.joinerDecShape);
+
+        const jointOutputs = await this.joinerSession.run({
+          [this.joinerEncName]: encTensor,
+          [this.joinerDecName]: decTensor,
+        });
+        const logits = jointOutputs[this.joinerOutputName];
+        if (!logits) {
+          throw new Error("Sherpa joiner output is missing.");
+        }
+
+        const nextToken = argmaxSlice(logits.data, 0, logits.data.length);
+        if (nextToken === this.blankTokenId) {
+          break;
+        }
+
+        tokenIds.push(nextToken);
+        tokenFrames.push({ startFrame: t, endFrame: t + 1 });
+
+        context.shift();
+        context.push(nextToken);
+      }
+    }
+
+    const secondsPerFrame = limit > 0 ? prepared.length / this.sampleRate / limit : 0;
+    return {
+      tokenIds,
+      tokenFrames,
+      words: wordTimestamps(this.tokens, tokenIds, tokenFrames, secondsPerFrame),
+      text: decodeText(this.tokens, tokenIds),
+    };
+  }
+
+  async transcribeWavBuffer(arrayBuffer) {
+    const decoded = decodeWav(arrayBuffer);
+    return this.transcribeSamples(decoded.samples, decoded.sampleRate);
+  }
+}
+
 export async function createAsrModel({
   modelType,
   decoderKind,
@@ -858,6 +1106,25 @@ export async function createAsrModel({
       config,
       tokens,
       session,
+    });
+  }
+
+  if (decoderKind === "sherpa-transducer") {
+    if (!encoderModel || !decoderModel || !decoderJointModel || !vocabularyText) {
+      throw new Error("sherpa-transducer requires encoder, decoder, joiner, and tokens.");
+    }
+    const [encoderSession, decoderSession, joinerSession] = await Promise.all([
+      ort.InferenceSession.create(encoderModel, sessionOptions),
+      ort.InferenceSession.create(decoderModel, sessionOptions),
+      ort.InferenceSession.create(decoderJointModel, sessionOptions),
+    ]);
+    const tokens = parseVocabulary(vocabularyText);
+    return new SherpaTransducerModel({
+      config,
+      tokens,
+      encoderSession,
+      decoderSession,
+      joinerSession,
     });
   }
 

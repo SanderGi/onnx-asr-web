@@ -15,6 +15,7 @@ Detected automatically from `config.json`:
 - `tone-ctc`
 - `whisper-ort`
 - `whisper`
+- sherpa transducer layout (no `config.json`)
 
 ## Install
 
@@ -73,6 +74,7 @@ console.log(result.words); // [{word, start, end}] in seconds
 - Tone CTC (`tone-ctc`): `model.onnx` with vocab from `decoder_params.vocabulary` in `config.json` (or `vocab.json`)
 - Whisper ORT (`whisper-ort`): `*_beamsearch.onnx` model, plus `vocab.json` (and optionally `added_tokens.json`)
 - Whisper HF (`whisper`): `onnx/encoder_model*.onnx`, `onnx/decoder_model_merged*.onnx`, plus `vocab.json` (and optionally `added_tokens.json`)
+- Sherpa transducer (no config): `am-onnx/` (or `am/`) with `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, plus `lang/tokens.txt` (or `tokens.txt`)
 
 When quantization is enabled (`quantization: "int8"`), `*.int8.onnx` is preferred.
 

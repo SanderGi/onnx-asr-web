@@ -33,6 +33,17 @@ async function fetchText(url, fetchImpl, headers) {
   return response.text();
 }
 
+async function fetchTextOptional(url, fetchImpl, headers) {
+  const response = await fetchImpl(url, { headers });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+  }
+  return response.text();
+}
+
 async function probeUrl(url, fetchImpl, headers) {
   const head = await fetchImpl(url, { method: "HEAD", headers });
   if (head.ok) {
@@ -205,6 +216,40 @@ async function resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, he
   throw new Error("Could not resolve nemo-conformer RNNT or CTC artifacts.");
 }
 
+async function resolveSherpaFromBase(baseUrl, quantization, fetchImpl, headers) {
+  const amOnnxProbe = modelFilenameCandidates("am-onnx/encoder.onnx", quantization);
+  const amProbe = modelFilenameCandidates("am/encoder.onnx", quantization);
+  const amDir = await resolveFirstExistingUrl(baseUrl, [...amOnnxProbe, ...amProbe], fetchImpl, headers)
+    .then((url) => (url.includes("/am-onnx/") ? "am-onnx" : "am"))
+    .catch(() => null);
+  if (!amDir) {
+    return null;
+  }
+
+  const encoder = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates(`${amDir}/encoder.onnx`, quantization),
+    fetchImpl,
+    headers,
+  );
+  const decoder = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates(`${amDir}/decoder.onnx`, quantization),
+    fetchImpl,
+    headers,
+  );
+  const joiner = await resolveFirstExistingUrl(
+    baseUrl,
+    modelFilenameCandidates(`${amDir}/joiner.onnx`, quantization),
+    fetchImpl,
+    headers,
+  );
+  const tokensPath = await resolveFirstExistingUrl(baseUrl, ["lang/tokens.txt", "tokens.txt"], fetchImpl, headers);
+  const tokensText = await fetchText(tokensPath, fetchImpl, headers);
+
+  return { encoder, decoder, joiner, tokensText };
+}
+
 export async function loadLocalModel(baseUrl, options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
@@ -214,7 +259,25 @@ export async function loadLocalModel(baseUrl, options = {}) {
   const quantization = options.quantization ?? "int8";
   const headers = options.headers;
 
-  const configText = await fetchText(joinUrl(baseUrl, "config.json"), fetchImpl, headers);
+  const configText = await fetchTextOptional(joinUrl(baseUrl, "config.json"), fetchImpl, headers);
+  if (!configText) {
+    const sherpa = await resolveSherpaFromBase(baseUrl, quantization, fetchImpl, headers);
+    if (!sherpa) {
+      throw new Error("Could not detect model type: missing config.json and no sherpa am-onnx/am files.");
+    }
+    return createAsrModel({
+      modelType: "sherpa-transducer",
+      decoderKind: "sherpa-transducer",
+      config: { sample_rate: options.sampleRate ?? 16000, max_tokens_per_step: 10 },
+      encoderModel: sherpa.encoder,
+      decoderModel: sherpa.decoder,
+      decoderJointModel: sherpa.joiner,
+      vocabularyText: sherpa.tokensText,
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
+
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
 
@@ -371,7 +434,10 @@ export async function loadHuggingfaceModel(repoId, options = {}) {
     return loadLocalModel(baseUrl, { ...options, headers, fetch: fetchImpl });
   }
 
-  const configText = await fetchText(joinUrl(baseUrl, "config.json"), fetchImpl, headers);
+  const configText = await fetchTextOptional(joinUrl(baseUrl, "config.json"), fetchImpl, headers);
+  if (!configText) {
+    return loadLocalModel(baseUrl, { ...options, headers, fetch: fetchImpl });
+  }
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
 

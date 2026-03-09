@@ -278,14 +278,47 @@ function selectNemoConformerArtifacts(files, quantization) {
   throw new Error("Could not resolve nemo-conformer artifacts (RNNT or CTC).");
 }
 
+function selectSherpaArtifacts(files, quantization) {
+  const amDir = files.some((name) => name.startsWith("am-onnx/")) ? "am-onnx" : "am";
+  const encoder = pickQuantizedByPattern(files, new RegExp(`^${amDir}/encoder(?:\\.int8)?\\.onnx$`), quantization);
+  const decoder = pickQuantizedByPattern(files, new RegExp(`^${amDir}/decoder(?:\\.int8)?\\.onnx$`), quantization);
+  const joiner = pickQuantizedByPattern(files, new RegExp(`^${amDir}/joiner(?:\\.int8)?\\.onnx$`), quantization);
+  if (!encoder || !decoder || !joiner) {
+    throw new Error("Could not resolve sherpa transducer files under am-onnx/ or am/.");
+  }
+  const tokens = files.includes("lang/tokens.txt")
+    ? "lang/tokens.txt"
+    : (files.includes("tokens.txt") ? "tokens.txt" : null);
+  if (!tokens) {
+    throw new Error("Could not find tokens file (lang/tokens.txt or tokens.txt).");
+  }
+  return { encoder, decoder, joiner, tokens };
+}
+
 export async function loadLocalModel(modelDir, options = {}) {
   const quantization = options.quantization ?? "int8";
+  const files = await walkFiles(modelDir);
+
+  if (!files.includes("config.json")) {
+    const sherpa = selectSherpaArtifacts(files, quantization);
+    return createAsrModel({
+      modelType: "sherpa-transducer",
+      decoderKind: "sherpa-transducer",
+      config: { sample_rate: options.sampleRate ?? 16000, max_tokens_per_step: 10 },
+      encoderModel: join(modelDir, sherpa.encoder),
+      decoderModel: join(modelDir, sherpa.decoder),
+      decoderJointModel: join(modelDir, sherpa.joiner),
+      vocabularyText: await readFile(join(modelDir, sherpa.tokens), "utf8"),
+      sessionOptions: options.sessionOptions,
+      decoderOptions: options.decoderOptions,
+    });
+  }
+
   const configText = await readFile(join(modelDir, "config.json"), "utf8");
   const config = parseConfigText(configText);
   const { modelType, spec } = detectModelType(config);
 
   if (spec.decoderKind === "nemo-conformer") {
-    const files = await walkFiles(modelDir);
     const artifacts = selectNemoConformerArtifacts(files, quantization);
     const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
 
@@ -314,7 +347,6 @@ export async function loadLocalModel(modelDir, options = {}) {
   }
 
   if (spec.decoderKind === "gigaam") {
-    const files = await walkFiles(modelDir);
     const artifacts = selectGigaamArtifacts(config, files, quantization);
     const vocabPath = files.includes(artifacts.vocab) ? artifacts.vocab : (files.includes("vocab.txt") ? "vocab.txt" : null);
     if (!vocabPath) {
@@ -432,7 +464,19 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
 
   const configPath = join(modelDir, "config.json");
   if (options.forceDownload || !(await fileExists(configPath))) {
-    await downloadPath(baseUrl, modelDir, "config.json", requestOptions, { required: true });
+    await downloadPath(baseUrl, modelDir, "config.json", requestOptions, { required: false });
+  }
+
+  if (!(await fileExists(configPath))) {
+    const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+    const sherpa = selectSherpaArtifacts([...repoFiles], quantization);
+    for (const file of [sherpa.encoder, sherpa.decoder, sherpa.joiner, sherpa.tokens]) {
+      if (options.forceDownload || !(await fileExists(join(modelDir, file)))) {
+        await downloadPath(baseUrl, modelDir, file, requestOptions, { required: true });
+      }
+      await ensureSidecars(baseUrl, modelDir, file, requestOptions, repoFiles);
+    }
+    return modelDir;
   }
 
   const config = parseConfigText(await readFile(configPath, "utf8"));
