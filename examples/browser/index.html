@@ -21,6 +21,28 @@
       <input id="modelBaseUrl" type="text" value="/models/istupakov/parakeet-tdt-0.6b-v2-onnx/" size="60" />
     </label>
     <br /><br />
+
+    <label>
+      VAD:
+      <select id="vadMode">
+        <option value="none" selected>None</option>
+        <option value="local">Local base URL</option>
+        <option value="hf">Hugging Face repo id</option>
+      </select>
+    </label>
+    <br /><br />
+
+    <label>
+      VAD local base URL:
+      <input id="vadBaseUrl" type="text" value="/models/onnx-community/silero-vad/" size="60" />
+    </label>
+    <br /><br />
+
+    <label>
+      VAD Hugging Face repo id:
+      <input id="vadRepoId" type="text" value="onnx-community/silero-vad" size="40" />
+    </label>
+    <br /><br />
     <input id="audioFile" type="file" accept=".wav,audio/wav" />
     <button id="run">Transcribe</button>
 

@@ -4,3 +4,4 @@ node_modules/
 models
 test.wav
 test_ru.wav
+test_with_silence.wav

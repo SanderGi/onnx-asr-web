@@ -2,6 +2,7 @@ import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
 import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
+import { createSileroVadModel, withVadModel } from "./vad.js";
 
 export { configureOrtWeb };
 
@@ -295,13 +296,96 @@ function selectSherpaArtifacts(files, quantization) {
   return { encoder, decoder, joiner, tokens };
 }
 
+function vadModelCandidates(quantization = "int8") {
+  if (quantization && quantization !== "none" && quantization !== "float32" && quantization !== "fp32") {
+    return [`onnx/model_${quantization}.onnx`, "onnx/model.onnx", "model.onnx"];
+  }
+  return ["onnx/model.onnx", "onnx/model_int8.onnx", "model.onnx"];
+}
+
+function selectSileroVadArtifact(files, quantization) {
+  for (const candidate of vadModelCandidates(quantization)) {
+    if (files.includes(candidate)) {
+      return candidate;
+    }
+  }
+
+  const discovered = pickQuantizedByPattern(files, /^(?:onnx\/)?model(?:_[a-z0-9]+)?\.onnx$/i, quantization);
+  if (discovered) {
+    return discovered;
+  }
+  throw new Error("Could not resolve Silero VAD model file (expected onnx/model*.onnx).");
+}
+
+function resolveVadOption(options = {}) {
+  return options.vadModel ?? options.vad ?? null;
+}
+
+function attachVadIfProvided(asrModel, options = {}) {
+  const vadModel = resolveVadOption(options);
+  if (!vadModel) {
+    return asrModel;
+  }
+  return withVadModel(asrModel, vadModel, options.vadOptions);
+}
+
+async function createAsrModelWithVad(params, options = {}) {
+  const asrModel = await createAsrModel(params);
+  return attachVadIfProvided(asrModel, options);
+}
+
+export async function loadLocalVadModel(modelDir, options = {}) {
+  const quantization = options.quantization ?? "int8";
+  const modelPath = modelDir.endsWith(".onnx")
+    ? modelDir
+    : join(modelDir, selectSileroVadArtifact(await walkFiles(modelDir), quantization));
+  return createSileroVadModel({
+    modelPath,
+    sessionOptions: options.sessionOptions,
+    options: options.vadOptions,
+  });
+}
+
+export async function downloadHuggingfaceVadModel(repoId, options = {}) {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (!fetchImpl) {
+    throw new Error("No fetch implementation available.");
+  }
+
+  const quantization = options.quantization ?? "int8";
+  const repoParts = normalizeRepoId(repoId);
+  const cacheDir = options.cacheDir ?? "models";
+  const modelDir = join(cacheDir, ...repoParts);
+  const revision = options.revision ?? "main";
+  const baseUrl = resolveHfBaseUrl(repoId, revision, options.endpoint);
+
+  const hfToken = options.hfToken ?? process.env.HF_TOKEN;
+  const headers = hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined;
+  const requestOptions = { fetchImpl, headers, quantization };
+
+  await mkdir(modelDir, { recursive: true });
+
+  const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
+  const modelFile = selectSileroVadArtifact([...repoFiles], quantization);
+  if (options.forceDownload || !(await fileExists(join(modelDir, modelFile)))) {
+    await downloadPath(baseUrl, modelDir, modelFile, requestOptions, { required: true });
+  }
+
+  return modelDir;
+}
+
+export async function loadHuggingfaceVadModel(repoId, options = {}) {
+  const modelDir = await downloadHuggingfaceVadModel(repoId, options);
+  return loadLocalVadModel(modelDir, options);
+}
+
 export async function loadLocalModel(modelDir, options = {}) {
   const quantization = options.quantization ?? "int8";
   const files = await walkFiles(modelDir);
 
   if (!files.includes("config.json")) {
     const sherpa = selectSherpaArtifacts(files, quantization);
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType: "sherpa-transducer",
       decoderKind: "sherpa-transducer",
       config: { sample_rate: options.sampleRate ?? 16000, max_tokens_per_step: 10 },
@@ -311,7 +395,7 @@ export async function loadLocalModel(modelDir, options = {}) {
       vocabularyText: await readFile(join(modelDir, sherpa.tokens), "utf8"),
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   const configText = await readFile(join(modelDir, "config.json"), "utf8");
@@ -323,7 +407,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     const vocabulary = await selectOrReadVocabulary(modelDir, spec.vocabCandidates);
 
     if (artifacts.mode === "rnnt") {
-      return createAsrModel({
+      return createAsrModelWithVad({
         modelType,
         decoderKind: "rnnt",
         config,
@@ -332,10 +416,10 @@ export async function loadLocalModel(modelDir, options = {}) {
         vocabularyText: vocabulary.text,
         sessionOptions: options.sessionOptions,
         decoderOptions: options.decoderOptions,
-      });
+      }, options);
     }
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: "ctc",
       config,
@@ -343,7 +427,7 @@ export async function loadLocalModel(modelDir, options = {}) {
       vocabularyText: vocabulary.text,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "gigaam") {
@@ -354,7 +438,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     }
 
     if (artifacts.mode === "rnnt") {
-      return createAsrModel({
+      return createAsrModelWithVad({
         modelType,
         decoderKind: "gigaam-rnnt",
         config,
@@ -364,10 +448,10 @@ export async function loadLocalModel(modelDir, options = {}) {
         vocabularyText: await readFile(join(modelDir, vocabPath), "utf8"),
         sessionOptions: options.sessionOptions,
         decoderOptions: options.decoderOptions,
-      });
+      }, options);
     }
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: "ctc",
       config,
@@ -375,12 +459,12 @@ export async function loadLocalModel(modelDir, options = {}) {
       vocabularyText: await readFile(join(modelDir, vocabPath), "utf8"),
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "whisper-ort") {
     const artifacts = await resolveWhisperLocalArtifacts(modelDir, quantization);
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: spec.decoderKind,
       config,
@@ -391,14 +475,14 @@ export async function loadLocalModel(modelDir, options = {}) {
         : "{}",
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "whisper-hf") {
     const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
     const decoderFile = await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization);
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: spec.decoderKind,
       config,
@@ -410,7 +494,7 @@ export async function loadLocalModel(modelDir, options = {}) {
         : "{}",
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
@@ -430,7 +514,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     }
   }
 
-  return createAsrModel({
+  return createAsrModelWithVad({
     modelType,
     decoderKind: spec.decoderKind,
     config,
@@ -440,7 +524,7 @@ export async function loadLocalModel(modelDir, options = {}) {
     vocabularyText,
     sessionOptions: options.sessionOptions,
     decoderOptions: options.decoderOptions,
-  });
+  }, options);
 }
 
 export async function downloadHuggingfaceModel(repoId, options = {}) {

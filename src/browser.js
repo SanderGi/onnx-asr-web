@@ -1,5 +1,6 @@
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
 import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
+import { createSileroVadModel, withVadModel } from "./vad.js";
 
 export { configureOrtWeb };
 
@@ -250,6 +251,46 @@ async function resolveSherpaFromBase(baseUrl, quantization, fetchImpl, headers) 
   return { encoder, decoder, joiner, tokensText };
 }
 
+function vadModelCandidates(quantization = "int8") {
+  if (quantization && quantization !== "none" && quantization !== "float32" && quantization !== "fp32") {
+    return [`onnx/model_${quantization}.onnx`, "onnx/model.onnx", "model.onnx"];
+  }
+  return ["onnx/model.onnx", "onnx/model_int8.onnx", "model.onnx"];
+}
+
+function resolveVadOption(options = {}) {
+  return options.vadModel ?? options.vad ?? null;
+}
+
+function attachVadIfProvided(asrModel, options = {}) {
+  const vadModel = resolveVadOption(options);
+  if (!vadModel) {
+    return asrModel;
+  }
+  return withVadModel(asrModel, vadModel, options.vadOptions);
+}
+
+async function createAsrModelWithVad(params, options = {}) {
+  const asrModel = await createAsrModel(params);
+  return attachVadIfProvided(asrModel, options);
+}
+
+export async function loadLocalVadModel(baseUrl, options = {}) {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (!fetchImpl) {
+    throw new Error("No fetch implementation available.");
+  }
+
+  const quantization = options.quantization ?? "int8";
+  const headers = options.headers;
+  const modelUrl = await resolveFirstExistingUrl(baseUrl, vadModelCandidates(quantization), fetchImpl, headers);
+  return createSileroVadModel({
+    modelPath: modelUrl,
+    sessionOptions: options.sessionOptions,
+    options: options.vadOptions,
+  });
+}
+
 export async function loadLocalModel(baseUrl, options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
@@ -265,7 +306,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
     if (!sherpa) {
       throw new Error("Could not detect model type: missing config.json and no sherpa am-onnx/am files.");
     }
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType: "sherpa-transducer",
       decoderKind: "sherpa-transducer",
       config: { sample_rate: options.sampleRate ?? 16000, max_tokens_per_step: 10 },
@@ -275,7 +316,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       vocabularyText: sherpa.tokensText,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   const config = parseConfigText(configText);
@@ -293,7 +334,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       ? await fetchText(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers)
       : "{}";
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: spec.decoderKind,
       config,
@@ -302,7 +343,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       addedTokensJson,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "whisper-hf") {
@@ -313,7 +354,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       probeUrl(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers),
     ]);
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: spec.decoderKind,
       config,
@@ -325,13 +366,13 @@ export async function loadLocalModel(baseUrl, options = {}) {
         : "{}",
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "gigaam") {
     const artifacts = await resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, headers);
     if (artifacts.mode === "rnnt") {
-      return createAsrModel({
+      return createAsrModelWithVad({
         modelType,
         decoderKind: "gigaam-rnnt",
         config,
@@ -341,10 +382,10 @@ export async function loadLocalModel(baseUrl, options = {}) {
         vocabularyText: artifacts.vocabularyText,
         sessionOptions: options.sessionOptions,
         decoderOptions: options.decoderOptions,
-      });
+      }, options);
     }
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: "ctc",
       config,
@@ -352,7 +393,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       vocabularyText: artifacts.vocabularyText,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   if (spec.decoderKind === "nemo-conformer") {
@@ -360,7 +401,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
     const vocabularyText = await fetchFirstExistingText(baseUrl, spec.vocabCandidates, fetchImpl, headers);
 
     if (artifacts.mode === "rnnt") {
-      return createAsrModel({
+      return createAsrModelWithVad({
         modelType,
         decoderKind: "rnnt",
         config,
@@ -369,10 +410,10 @@ export async function loadLocalModel(baseUrl, options = {}) {
         vocabularyText,
         sessionOptions: options.sessionOptions,
         decoderOptions: options.decoderOptions,
-      });
+      }, options);
     }
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: "ctc",
       config,
@@ -380,7 +421,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       vocabularyText,
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   const [encoderModel, decoderJointModel, vocabularyText, preprocessorModel] = await Promise.all([
@@ -403,7 +444,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
       : Promise.resolve(null),
   ]);
 
-  return createAsrModel({
+  return createAsrModelWithVad({
     modelType,
     decoderKind: spec.decoderKind,
     config,
@@ -413,7 +454,7 @@ export async function loadLocalModel(baseUrl, options = {}) {
     vocabularyText,
     sessionOptions: options.sessionOptions,
     decoderOptions: options.decoderOptions,
-  });
+  }, options);
 }
 
 export async function loadHuggingfaceModel(repoId, options = {}) {
@@ -448,7 +489,7 @@ export async function loadHuggingfaceModel(repoId, options = {}) {
       throw new Error("Could not find whisper-ort beamsearch ONNX in Hugging Face repo.");
     }
 
-    return createAsrModel({
+    return createAsrModelWithVad({
       modelType,
       decoderKind: spec.decoderKind,
       config,
@@ -459,8 +500,24 @@ export async function loadHuggingfaceModel(repoId, options = {}) {
         : "{}",
       sessionOptions: options.sessionOptions,
       decoderOptions: options.decoderOptions,
-    });
+    }, options);
   }
 
   return loadLocalModel(baseUrl, { ...options, headers, fetch: fetchImpl });
+}
+
+export async function loadHuggingfaceVadModel(repoId, options = {}) {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (!fetchImpl) {
+    throw new Error("No fetch implementation available.");
+  }
+
+  const revision = options.revision ?? "main";
+  const endpoint = (options.endpoint ?? "https://huggingface.co").replace(/\/$/, "");
+  const headers = options.hfToken
+    ? { ...(options.headers ?? {}), Authorization: `Bearer ${options.hfToken}` }
+    : options.headers;
+  const baseUrl = `${endpoint}/${repoId}/resolve/${encodeURIComponent(revision)}/`;
+
+  return loadLocalVadModel(baseUrl, { ...options, headers, fetch: fetchImpl });
 }

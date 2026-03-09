@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { loadHuggingfaceModel, loadLocalModel } from "../../src/node.js";
+import {
+  loadHuggingfaceModel,
+  loadHuggingfaceVadModel,
+  loadLocalModel,
+  loadLocalVadModel,
+} from "../../src/node.js";
 
 function parseArgs(argv) {
   const args = {};
@@ -16,6 +21,10 @@ function parseArgs(argv) {
       args.quantization = argv[++i];
     } else if (current === "--audio") {
       args.audio = argv[++i];
+    } else if (current === "--vad-model-dir") {
+      args.vadModelDir = argv[++i];
+    } else if (current === "--vad-repo-id") {
+      args.vadRepoId = argv[++i];
     } else if (current === "--help") {
       args.help = true;
     }
@@ -25,7 +34,7 @@ function parseArgs(argv) {
 
 function printUsage() {
   console.log(
-    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none]",
+    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none] [--vad-model-dir <path> | --vad-repo-id <org/repo>]"
   );
   console.log("");
   console.log("Expected model files in model dir/cache:");
@@ -35,7 +44,10 @@ function printUsage() {
   console.log("  vocab.txt or tokens.txt");
   console.log("  optional: nemo128.onnx (required for nemo-conformer-tdt)");
   console.log("");
-  console.log("By default, --quantization is int8 (prefers *.int8.onnx when available).");
+  console.log(
+    "By default, --quantization is int8 (prefers *.int8.onnx when available)."
+  );
+  console.log("Optional VAD: onnx-community/silero-vad (onnx/model*.onnx).");
 }
 
 async function main() {
@@ -45,32 +57,52 @@ async function main() {
     process.exit(args.help ? 0 : 1);
   }
 
+  const vadModel = args.vadRepoId
+    ? await loadHuggingfaceVadModel(args.vadRepoId, {
+        cacheDir: args.cacheDir,
+        quantization: args.quantization,
+        sessionOptions: { executionProviders: ["wasm"] },
+      })
+    : args.vadModelDir
+    ? await loadLocalVadModel(args.vadModelDir, {
+        quantization: args.quantization,
+        sessionOptions: { executionProviders: ["wasm"] },
+      })
+    : null;
+
   const model = args.repoId
     ? await loadHuggingfaceModel(args.repoId, {
         cacheDir: args.cacheDir,
         quantization: args.quantization,
         sessionOptions: { executionProviders: ["wasm"] },
+        vadModel,
       })
     : await loadLocalModel(args.modelDir, {
         quantization: args.quantization,
         sessionOptions: { executionProviders: ["wasm"] },
+        vadModel,
       });
 
   const wavBuffer = await readFile(args.audio);
-  const { text, tokenIds, words } = await model.transcribeWavBuffer(
+  const { text, tokenIds, words, segments } = await model.transcribeWavBuffer(
     wavBuffer.buffer.slice(
       wavBuffer.byteOffset,
-      wavBuffer.byteOffset + wavBuffer.byteLength,
-    ),
+      wavBuffer.byteOffset + wavBuffer.byteLength
+    )
   );
 
   console.log(`Audio: ${basename(args.audio)}`);
   console.log(`Tokens: ${tokenIds.length}`);
   console.log(`Text: ${text}`);
+  if (vadModel !== null) {
+    console.log(`VAD segments: ${segments.length}`);
+  }
   if (words.length > 0) {
     console.log("Words:");
     for (const word of words) {
-      console.log(`  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`);
+      console.log(
+        `  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`
+      );
     }
   }
 }

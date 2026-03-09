@@ -1,21 +1,25 @@
 # onnx-asr-web
 
-JavaScript ONNX ASR for Node.js and browser using [`onnxruntime-web`](https://github.com/microsoft/onnxruntime/tree/main/js/web). This package was heavily inspired by the Python [`istupakov/onnx-asr`](https://github.com/istupakov/onnx-asr).
+JavaScript ONNX ASR for Node.js and browser using [`onnxruntime-web`](https://github.com/microsoft/onnxruntime/tree/main/js/web). This package was heavily inspired by the Python [`istupakov/onnx-asr`](https://github.com/istupakov/onnx-asr) and aims to be the minimalistic way to achieve state of the art automatic speech recognition with JavaScript.
+
+## Features
+
+- Loads models from Hugging Face or local directories
+- Autodetects model-type from files
+- Supports quantized models
+- Works with WAV files/buffers
+- Uses Voice Activity Detection (VAD) to do long-form speech-to-text
+- Extracts word-level timestamps
+- Minimal dependencies (just `onnxruntime-web`)
 
 ## Supported Model Types
 
-Detected automatically from `config.json`:
-
-- `nemo-conformer-tdt`
-- `nemo-conformer-rnnt`
-- `nemo-conformer-ctc`
-- `nemo-conformer-aed`
-- `nemo-conformer`
-- `gigaam` (v2/v3)
-- `tone-ctc`
-- `whisper-ort`
-- `whisper`
-- sherpa transducer layout (no `config.json`)
+- Nvidia Parakeet, Canary, FastFormer, and Conformer
+- OpenAI Whisper
+- GigaChat GigaAM
+- Kaldi Icefall Zipformer
+- T-Tech T-one
+- Custom CTC, RNNT, TDT, and Transformer models
 
 ## Install
 
@@ -26,11 +30,22 @@ npm install
 ## Node.js API
 
 ```js
-import { loadLocalModel, loadHuggingfaceModel } from "onnx-asr-web/node";
+import {
+  loadLocalModel,
+  loadHuggingfaceModel,
+  loadLocalVadModel,
+  loadHuggingfaceVadModel,
+} from "onnx-asr-web/node";
+
+const vad = await loadHuggingfaceVadModel("onnx-community/silero-vad", {
+  cacheDir: "models",
+  quantization: "int8",
+});
 
 const local = await loadLocalModel("models/istupakov/parakeet-tdt-0.6b-v3-onnx", {
   quantization: "int8", // default: prefers *.int8.onnx, falls back to *.onnx
   sessionOptions: { executionProviders: ["wasm"] },
+  vadModel: vad, // optional: chunks long audio by non-speech
 });
 
 const hf = await loadHuggingfaceModel("istupakov/parakeet-tdt-0.6b-v3-onnx", {
@@ -45,11 +60,17 @@ const hf = await loadHuggingfaceModel("istupakov/parakeet-tdt-0.6b-v3-onnx", {
 ## Browser API
 
 ```js
-import { configureOrtWeb, loadLocalModel, loadHuggingfaceModel } from "onnx-asr-web/browser";
+import {
+  configureOrtWeb,
+  loadLocalModel,
+  loadHuggingfaceModel,
+  loadHuggingfaceVadModel,
+} from "onnx-asr-web/browser";
 
 configureOrtWeb({ wasmPaths: "/node_modules/onnxruntime-web/dist/" });
 
-const modelA = await loadLocalModel("/models/parakeet-tdt-0.6b-v3-onnx/");
+const vad = await loadHuggingfaceVadModel("onnx-community/silero-vad");
+const modelA = await loadLocalModel("/models/parakeet-tdt-0.6b-v3-onnx/", { vadModel: vad });
 const modelB = await loadHuggingfaceModel("istupakov/parakeet-tdt-0.6b-v3-onnx");
 ```
 
@@ -75,11 +96,14 @@ console.log(result.words); // [{word, start, end}] in seconds
 - Whisper ORT (`whisper-ort`): `*_beamsearch.onnx` model, plus `vocab.json` (and optionally `added_tokens.json`)
 - Whisper HF (`whisper`): `onnx/encoder_model*.onnx`, `onnx/decoder_model_merged*.onnx`, plus `vocab.json` (and optionally `added_tokens.json`)
 - Sherpa transducer (no config): `am-onnx/` (or `am/`) with `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, plus `lang/tokens.txt` (or `tokens.txt`)
+- VAD (`onnx-community/silero-vad`): `onnx/model*.onnx` (e.g. `onnx/model_int8.onnx`)
 
 When quantization is enabled (`quantization: "int8"`), `*.int8.onnx` is preferred.
 
 For Node Hugging Face downloads, `*.onnx.data` sidecars are also fetched when present.
 In browser mode, models are loaded by URL so ONNX Runtime can fetch sidecars automatically.
+
+When `vadModel` is supplied to `loadLocalModel()` / `loadHuggingfaceModel()`, transcription runs on VAD speech chunks and returns a `segments` array in output.
 
 Word timestamps are currently provided for NeMo transducer models. Whisper returns transcript text and token IDs; `words` is empty.
 

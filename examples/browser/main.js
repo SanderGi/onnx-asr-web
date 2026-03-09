@@ -1,9 +1,17 @@
-import { configureOrtWeb, loadLocalModel } from "../../src/browser.js";
+import {
+  configureOrtWeb,
+  loadHuggingfaceVadModel,
+  loadLocalModel,
+  loadLocalVadModel,
+} from "../../src/browser.js";
 
 const output = document.getElementById("output");
 const wordsRoot = document.getElementById("words");
 const audioInput = document.getElementById("audioFile");
 const modelInput = document.getElementById("modelBaseUrl");
+const vadModeInput = document.getElementById("vadMode");
+const vadBaseInput = document.getElementById("vadBaseUrl");
+const vadRepoInput = document.getElementById("vadRepoId");
 const runButton = document.getElementById("run");
 
 configureOrtWeb({
@@ -11,6 +19,7 @@ configureOrtWeb({
 });
 
 let modelPromise = null;
+let modelCacheKey = "";
 let audioContext = null;
 let decodedAudioBuffer = null;
 let currentSource = null;
@@ -101,6 +110,48 @@ function renderWords(words) {
   }
 }
 
+function getModelCacheKey() {
+  return JSON.stringify({
+    asrBaseUrl: modelInput.value.trim(),
+    vadMode: vadModeInput.value,
+    vadBaseUrl: vadBaseInput.value.trim(),
+    vadRepoId: vadRepoInput.value.trim(),
+  });
+}
+
+function isVadEnabled() {
+  return vadModeInput.value !== "none";
+}
+
+async function resolveVadModel() {
+  const mode = vadModeInput.value;
+  if (mode === "none") {
+    return null;
+  }
+
+  if (mode === "local") {
+    const baseUrl = vadBaseInput.value.trim();
+    if (!baseUrl) {
+      throw new Error("Enter VAD local base URL.");
+    }
+    return loadLocalVadModel(baseUrl, {
+      sessionOptions: { executionProviders: ["wasm"] },
+    });
+  }
+
+  if (mode === "hf") {
+    const repoId = vadRepoInput.value.trim();
+    if (!repoId) {
+      throw new Error("Enter VAD Hugging Face repo id.");
+    }
+    return loadHuggingfaceVadModel(repoId, {
+      sessionOptions: { executionProviders: ["wasm"] },
+    });
+  }
+
+  throw new Error(`Unsupported VAD mode: ${mode}`);
+}
+
 runButton.addEventListener("click", async () => {
   const file = audioInput.files?.[0];
   if (!file) {
@@ -117,10 +168,14 @@ runButton.addEventListener("click", async () => {
   try {
     output.textContent = "Loading model...";
     wordsRoot.textContent = "";
-    if (!modelPromise) {
+    const cacheKey = getModelCacheKey();
+    if (!modelPromise || modelCacheKey !== cacheKey) {
+      const vadModel = await resolveVadModel();
       modelPromise = loadLocalModel(baseUrl, {
         sessionOptions: { executionProviders: ["wasm"] },
+        vadModel,
       });
+      modelCacheKey = cacheKey;
     }
 
     const model = await modelPromise;
@@ -130,11 +185,24 @@ runButton.addEventListener("click", async () => {
     await decodeAudioForPlayback(audioBytes);
 
     const result = await model.transcribeWavBuffer(audioBytes);
-    output.textContent = result.text;
+    const lines = [result.text];
+    if (isVadEnabled()) {
+      if (!Array.isArray(result.segments)) {
+        throw new Error("VAD is enabled, but transcription result has no segments. Model was likely loaded without VAD.");
+      }
+      lines.push("");
+      lines.push(`VAD: enabled (${vadModeInput.value})`);
+      lines.push(`VAD segments: ${result.segments.length}`);
+      for (const segment of result.segments) {
+        lines.push(`  [${formatSeconds(segment.startSec)} - ${formatSeconds(segment.endSec)}]`);
+      }
+    }
+    output.textContent = lines.join("\n");
     renderWords(result.words);
   } catch (error) {
     output.textContent = String(error);
     wordsRoot.textContent = "";
     modelPromise = null;
+    modelCacheKey = "";
   }
 });
