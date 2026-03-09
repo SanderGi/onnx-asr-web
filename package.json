@@ -1,0 +1,25 @@
+{
+  "name": "onnx-asr-web",
+  "version": "0.1.0",
+  "description": "JavaScript ONNX ASR for Node.js and browser",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./node": "./src/node.js",
+    "./browser": "./src/browser.js"
+  },
+  "scripts": {
+    "check": "node --check src/*.js examples/node/transcribe.mjs"
+  },
+  "keywords": [
+    "onnx",
+    "asr",
+    "onnxruntime-web",
+    "speech-to-text"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "onnxruntime-web": "^1.23.0"
+  }
+}

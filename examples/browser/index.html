@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onnx-asr-web demo</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "onnxruntime-web": "../../node_modules/onnxruntime-web/dist/ort.all.min.mjs"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <h1>onnx-asr-web browser demo</h1>
+    <p>Choose a WAV file, then click transcribe.</p>
+
+    <label>
+      Model base URL:
+      <input id="modelBaseUrl" type="text" value="/models/istupakov/parakeet-tdt-0.6b-v2-onnx/" size="60" />
+    </label>
+    <br /><br />
+    <input id="audioFile" type="file" accept=".wav,audio/wav" />
+    <button id="run">Transcribe</button>
+
+    <pre id="output"></pre>
+    <div id="words"></div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
