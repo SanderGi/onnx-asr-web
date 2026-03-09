@@ -1,6 +1,16 @@
+<p align="center">
+  <img src="logo.png" alt="onnx-asr-web logo" width="100"/>
+</p>
+
 # onnx-asr-web
 
+[![npm version](https://img.shields.io/npm/v/onnx-asr-web)](https://www.npmjs.com/package/onnx-asr-web)
+[![npm downloads](https://img.shields.io/npm/dm/onnx-asr-web)](https://www.npmjs.com/package/onnx-asr-web)
+[![license](https://img.shields.io/npm/l/onnx-asr-web)](./LICENSE)
+
 JavaScript ONNX ASR for Node.js and browser using [`onnxruntime-web`](https://github.com/microsoft/onnxruntime/tree/main/js/web). This package was heavily inspired by the Python [`istupakov/onnx-asr`](https://github.com/istupakov/onnx-asr) and aims to be the minimalistic way to achieve state of the art automatic speech recognition with JavaScript.
+
+[Online Demo Here!](https://sandergi.com/cdn/onnx-asr-web/example/index.html)
 
 ## Features
 
@@ -24,8 +34,10 @@ JavaScript ONNX ASR for Node.js and browser using [`onnxruntime-web`](https://gi
 ## Install
 
 ```bash
-npm install
+npm install onnx-asr-web
 ```
+
+`onnxruntime-web` must be `1.24.x` or newer. Earlier versions can fail on some models (notably browser VAD graphs).
 
 ## Node.js API
 
@@ -118,3 +130,32 @@ node examples/node/transcribe.mjs --repo-id istupakov/parakeet-tdt-0.6b-v3-onnx 
 ```bash
 npx http-server . # then /examples/browser/index.html
 ```
+
+### Browser UI (CDN package import)
+```bash
+npx http-server . # then /examples/browser-cdn/index.html
+```
+
+## Build and Publish
+
+Create distributable artifacts:
+
+```bash
+npm run build
+```
+
+This produces:
+
+- `dist/index.js`
+- `dist/node.js`
+- `dist/browser.js`
+
+Publish to npm:
+
+```bash
+npm publish
+```
+
+## Contributing
+
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
