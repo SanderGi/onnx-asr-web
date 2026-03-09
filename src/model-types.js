@@ -20,6 +20,13 @@ export const MODEL_TYPES = {
     decoderJoint: null,
     vocabCandidates: ["vocab.txt", "tokens.txt"],
   },
+  "nemo-conformer-aed": {
+    decoderKind: "aed",
+    preprocessor: null,
+    encoder: "encoder-model.onnx",
+    decoderJoint: "decoder-model.onnx",
+    vocabCandidates: ["vocab.txt", "tokens.txt"],
+  },
   "whisper-ort": {
     decoderKind: "whisper-ort",
     preprocessor: null,

@@ -187,6 +187,217 @@ export class AsrModel {
   }
 }
 
+function intTensorFor(type, values, dims) {
+  if (type === "int64") {
+    return new ort.Tensor("int64", BigInt64Array.from(values.map((x) => BigInt(x))), dims);
+  }
+  return new ort.Tensor("int32", Int32Array.from(values), dims);
+}
+
+function zerosTensor(type, shape) {
+  const size = shape.reduce((acc, value) => acc * value, 1);
+  if (type !== "float32") {
+    throw new Error(`Unsupported tensor init type '${type}'.`);
+  }
+  return new ort.Tensor("float32", new Float32Array(size), shape);
+}
+
+function argmaxSlice(data, start, length) {
+  let bestIndex = 0;
+  let bestValue = -Infinity;
+  for (let i = 0; i < length; i += 1) {
+    const value = data[start + i];
+    if (value > bestValue) {
+      bestValue = value;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+export class NemoAedModel {
+  constructor({ config, tokens, encoderSession, decoderSession }) {
+    this.config = config;
+    this.tokens = tokens;
+    this.tokenToId = new Map();
+    for (let i = 0; i < tokens.length; i += 1) {
+      const token = tokens[i];
+      if (token != null && !this.tokenToId.has(token)) {
+        this.tokenToId.set(token, i);
+      }
+    }
+
+    this.encoderSession = encoderSession;
+    this.decoderSession = decoderSession;
+    this.encoderHelper = new EncoderModel(encoderSession, { config, sampleRate: 16000 });
+    this.sampleRate = 16000;
+    this.maxSequenceLength = config?.max_sequence_length ?? 1024;
+
+    this.encoderOutputEmbeddingsName = encoderSession.outputNames.includes("encoder_embeddings")
+      ? "encoder_embeddings"
+      : encoderSession.outputNames[0];
+    this.encoderOutputMaskName = encoderSession.outputNames.includes("encoder_mask")
+      ? "encoder_mask"
+      : encoderSession.outputNames[1];
+
+    this.decoderInputIdName = decoderSession.inputNames.includes("input_ids")
+      ? "input_ids"
+      : decoderSession.inputNames[0];
+    this.decoderEncoderEmbeddingsName = decoderSession.inputNames.includes("encoder_embeddings")
+      ? "encoder_embeddings"
+      : decoderSession.inputNames[1];
+    this.decoderEncoderMaskName = decoderSession.inputNames.includes("encoder_mask")
+      ? "encoder_mask"
+      : decoderSession.inputNames[2];
+    this.decoderMemsName = decoderSession.inputNames.includes("decoder_mems")
+      ? "decoder_mems"
+      : decoderSession.inputNames[3];
+
+    this.decoderInputIdType =
+      decoderSession.inputMetadata.find((meta) => meta.name === this.decoderInputIdName)?.type ?? "int32";
+    const memMeta = decoderSession.inputMetadata.find((meta) => meta.name === this.decoderMemsName);
+    if (!memMeta) {
+      throw new Error("Decoder input metadata for decoder_mems is missing.");
+    }
+    this.decoderMemsType = memMeta.type;
+    this.decoderMemsShapeTemplate = memMeta.shape;
+
+    this.logitsName = decoderSession.outputNames.includes("logits")
+      ? "logits"
+      : decoderSession.outputNames[0];
+    this.decoderHiddenStatesName = decoderSession.outputNames.includes("decoder_hidden_states")
+      ? "decoder_hidden_states"
+      : decoderSession.outputNames[1];
+  }
+
+  canaryPrefix(options = {}) {
+    const fallbackLanguage = options.language ?? "en";
+    const targetLanguage = options.targetLanguage ?? "en";
+    const pnc = options.pnc ?? "yes";
+
+    const values = [
+      "<|startofcontext|>",
+      "<|startoftranscript|>",
+      "<|emo:undefined|>",
+      `<|${fallbackLanguage}|>`,
+      `<|${targetLanguage}|>`,
+      pnc === "yes" ? "<|pnc|>" : "<|nopnc|>",
+      "<|noitn|>",
+      "<|notimestamp|>",
+      "<|nodiarize|>",
+    ];
+
+    return values.map((token) => {
+      const id = this.tokenToId.get(token);
+      if (id == null) {
+        throw new Error(`Required Canary token not found in vocab: ${token}`);
+      }
+      return id;
+    });
+  }
+
+  initialMems(batchSize) {
+    const shape = this.decoderMemsShapeTemplate.map((dim, index) => {
+      if (typeof dim === "number") {
+        return dim;
+      }
+      if (index === 1) {
+        return batchSize;
+      }
+      if (index === 2) {
+        return 0;
+      }
+      return 1;
+    });
+    return zerosTensor(this.decoderMemsType, shape);
+  }
+
+  async transcribeSamples(samples, sampleRate = this.sampleRate, options = {}) {
+    let prepared = samples;
+    if (!(prepared instanceof Float32Array)) {
+      prepared = Float32Array.from(prepared);
+    }
+    if (sampleRate !== this.sampleRate) {
+      prepared = resampleLinear(prepared, sampleRate, this.sampleRate);
+    }
+
+    const encoderInputs = this.encoderHelper.prepareInputsFromWaveform(prepared);
+    const encoderOutputs = await this.encoderSession.run({
+      [this.encoderHelper.audioSignalName]: encoderInputs.signal,
+      [this.encoderHelper.lengthName]: encoderInputs.length,
+    });
+
+    const encoderEmbeddings = encoderOutputs[this.encoderOutputEmbeddingsName];
+    const encoderMask = encoderOutputs[this.encoderOutputMaskName];
+    if (!encoderEmbeddings || !encoderMask) {
+      throw new Error("Canary encoder outputs are missing required tensors.");
+    }
+
+    const prefix = this.canaryPrefix(options);
+    const batchTokens = [prefix.slice()];
+    const prefixLength = batchTokens[0].length;
+    const eosId = this.tokenToId.get("<|endoftext|>");
+    if (eosId == null) {
+      throw new Error("Canary vocab is missing <|endoftext|> token.");
+    }
+
+    let decoderMems = this.initialMems(batchTokens.length);
+    while (batchTokens[0].length < this.maxSequenceLength) {
+      const inputIds = decoderMems.dims[2] === 0
+        ? batchTokens.flat()
+        : batchTokens.map((row) => row[row.length - 1]);
+      const sequenceLength = decoderMems.dims[2] === 0 ? batchTokens[0].length : 1;
+      const inputTensor = intTensorFor(this.decoderInputIdType, inputIds, [batchTokens.length, sequenceLength]);
+
+      const decoderOutputs = await this.decoderSession.run({
+        [this.decoderInputIdName]: inputTensor,
+        [this.decoderEncoderEmbeddingsName]: encoderEmbeddings,
+        [this.decoderEncoderMaskName]: encoderMask,
+        [this.decoderMemsName]: decoderMems,
+      });
+
+      const logits = decoderOutputs[this.logitsName];
+      const nextMems = decoderOutputs[this.decoderHiddenStatesName];
+      if (!logits || !nextMems) {
+        throw new Error("Canary decoder outputs are missing logits or decoder state.");
+      }
+
+      decoderMems = nextMems;
+
+      const [batchSize, seq, vocab] = logits.dims;
+      let allEos = true;
+      for (let b = 0; b < batchSize; b += 1) {
+        const offset = b * seq * vocab + (seq - 1) * vocab;
+        const nextToken = argmaxSlice(logits.data, offset, vocab);
+        batchTokens[b].push(nextToken);
+        if (nextToken !== eosId) {
+          allEos = false;
+        }
+      }
+
+      if (allEos) {
+        break;
+      }
+    }
+
+    const tokenIds = batchTokens[0]
+      .slice(prefixLength)
+      .filter((id) => this.tokens[id] && !this.tokens[id].startsWith("<|"));
+
+    return {
+      tokenIds,
+      tokenFrames: [],
+      words: [],
+      text: decodeText(this.tokens, tokenIds),
+    };
+  }
+
+  async transcribeWavBuffer(arrayBuffer, options = {}) {
+    const decoded = decodeWav(arrayBuffer);
+    return this.transcribeSamples(decoded.samples, decoded.sampleRate, options);
+  }
+}
+
 export async function createAsrModel({
   modelType,
   decoderKind,
@@ -231,6 +442,23 @@ export async function createAsrModel({
       config,
       vocab: JSON.parse(vocabJson),
       addedTokens: addedTokensJson ? JSON.parse(addedTokensJson) : {},
+      encoderSession,
+      decoderSession,
+    });
+  }
+
+  if (decoderKind === "aed") {
+    if (!encoderModel || !decoderJointModel || !vocabularyText) {
+      throw new Error("nemo-conformer-aed requires encoderModel, decoderModel, and vocabularyText.");
+    }
+    const [encoderSession, decoderSession] = await Promise.all([
+      ort.InferenceSession.create(encoderModel, sessionOptions),
+      ort.InferenceSession.create(decoderJointModel, sessionOptions),
+    ]);
+    const tokens = parseVocabulary(vocabularyText);
+    return new NemoAedModel({
+      config,
+      tokens,
       encoderSession,
       decoderSession,
     });
