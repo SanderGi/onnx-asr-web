@@ -1,10 +1,47 @@
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
 import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
-import { createSileroVadModel, withVadModel } from "./vad.js";
+import type {
+  AsrTranscriber,
+  CommonModelLoadOptions,
+  DecoderOptions,
+  SessionOptions,
+  VadDetector,
+  VadRuntimeOptions,
+} from "./types.js";
+import {
+  createSileroVadModel,
+  withVadModel,
+} from "./vad.js";
+
+type HeadersMap = Record<string, string>;
+type VadOptions = VadRuntimeOptions;
+
+/** Browser loader options for local URLs and Hugging Face model ids. */
+export interface BrowserModelLoadOptions extends CommonModelLoadOptions {
+  sessionOptions?: SessionOptions;
+  decoderOptions?: DecoderOptions;
+  vadModel?: VadDetector | null;
+  vad?: VadDetector | null;
+  vadOptions?: VadOptions;
+  headers?: HeadersMap;
+  fetch?: typeof fetch;
+  whisperModelCandidates?: string[];
+  skipRepoListing?: boolean;
+  hfToken?: string;
+  revision?: string;
+  endpoint?: string;
+}
 
 export { configureOrtWeb };
 
-function modelFilenameCandidates(filename, quantization = "int8") {
+function requireString(value: string | null | undefined, message: string): string {
+  if (!value) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function modelFilenameCandidates(filename: string, quantization = "int8"): string[] {
   if (!filename.endsWith(".onnx")) {
     return [filename];
   }
@@ -16,7 +53,7 @@ function modelFilenameCandidates(filename, quantization = "int8") {
   return [...new Set([dotInt8, underscoreInt8, filename])];
 }
 
-function joinUrl(baseUrl, file) {
+function joinUrl(baseUrl: string, file: string): string {
   const withSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const pageHref =
     typeof globalThis.location?.href === "string"
@@ -26,7 +63,7 @@ function joinUrl(baseUrl, file) {
   return new URL(file, resolvedBase).toString();
 }
 
-async function fetchText(url, fetchImpl, headers) {
+async function fetchText(url: string, fetchImpl: typeof fetch, headers?: HeadersMap): Promise<string> {
   const response = await fetchImpl(url, { headers });
   if (!response.ok) {
     throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
@@ -34,7 +71,7 @@ async function fetchText(url, fetchImpl, headers) {
   return response.text();
 }
 
-async function fetchTextOptional(url, fetchImpl, headers) {
+async function fetchTextOptional(url: string, fetchImpl: typeof fetch, headers?: HeadersMap): Promise<string | null> {
   const response = await fetchImpl(url, { headers });
   if (response.status === 404) {
     return null;
@@ -45,7 +82,7 @@ async function fetchTextOptional(url, fetchImpl, headers) {
   return response.text();
 }
 
-async function probeUrl(url, fetchImpl, headers) {
+async function probeUrl(url: string, fetchImpl: typeof fetch, headers?: HeadersMap): Promise<boolean> {
   const head = await fetchImpl(url, { method: "HEAD", headers });
   if (head.ok) {
     return true;
@@ -64,7 +101,11 @@ async function probeUrl(url, fetchImpl, headers) {
   throw new Error(`Failed to probe ${url}: ${get.status} ${get.statusText}`);
 }
 
-async function resolveModelUrl(baseUrl, filename, options) {
+async function resolveModelUrl(
+  baseUrl: string,
+  filename: string,
+  options: { fetchImpl: typeof fetch; headers?: HeadersMap; quantization: string },
+): Promise<string> {
   const { fetchImpl, headers, quantization } = options;
   const candidates = modelFilenameCandidates(filename, quantization);
 
@@ -78,7 +119,12 @@ async function resolveModelUrl(baseUrl, filename, options) {
   return joinUrl(baseUrl, candidates[candidates.length - 1]);
 }
 
-async function resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers) {
+async function resolveFirstExistingUrl(
+  baseUrl: string,
+  candidates: readonly string[],
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<string> {
   for (const candidate of candidates) {
     const url = joinUrl(baseUrl, candidate);
     if (await probeUrl(url, fetchImpl, headers)) {
@@ -88,34 +134,45 @@ async function resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers) 
   throw new Error(`Missing file. Checked: ${candidates.join(", ")}`);
 }
 
-async function fetchFirstExistingText(baseUrl, candidates, fetchImpl, headers) {
+async function fetchFirstExistingText(
+  baseUrl: string,
+  candidates: readonly string[],
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<string> {
   const url = await resolveFirstExistingUrl(baseUrl, candidates, fetchImpl, headers);
   return fetchText(url, fetchImpl, headers);
 }
 
-function vocabJsonToText(vocabJsonText) {
+function vocabJsonToText(vocabJsonText: string): string {
   const parsed = JSON.parse(vocabJsonText);
   const entries = Object.entries(parsed)
     .filter(([, id]) => Number.isInteger(id))
-    .sort((a, b) => a[1] - b[1]);
+    .sort((a, b) => Number(a[1]) - Number(b[1]));
   if (entries.length === 0) {
     throw new Error("Invalid vocab.json mapping.");
   }
   return `${entries.map(([token, id]) => `${token} ${id}`).join("\n")}\n`;
 }
 
-async function listHuggingFaceRepoFiles(repoId, revision, endpoint, fetchImpl, headers) {
+async function listHuggingFaceRepoFiles(
+  repoId: string,
+  revision: string,
+  endpoint: string,
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<Set<string>> {
   const base = endpoint.replace(/\/$/, "");
   const url = `${base}/api/models/${repoId}/tree/${encodeURIComponent(revision)}?recursive=1`;
   const response = await fetchImpl(url, { headers });
   if (!response.ok) {
     throw new Error(`Failed to list Hugging Face repo files: ${response.status} ${response.statusText}`);
   }
-  const payload = await response.json();
-  return new Set(payload.map((item) => item.path).filter((path) => typeof path === "string"));
+  const payload = await response.json() as Array<{ path?: string }>;
+  return new Set(payload.map((item: { path?: string }) => item.path).filter((path: string | undefined): path is string => typeof path === "string"));
 }
 
-function pickWhisperBeamsearchFile(files, quantization) {
+function pickWhisperBeamsearchFile(files: ReadonlySet<string>, quantization: string): string | null {
   const list = [...files].filter((path) => /_beamsearch(?:\.int8)?\.onnx$/.test(path));
   if (list.length === 0) {
     return null;
@@ -129,7 +186,16 @@ function pickWhisperBeamsearchFile(files, quantization) {
   return list.find((name) => !/(?:\.int8|_int8)\.onnx$/.test(name)) ?? list[0];
 }
 
-async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, headers) {
+async function resolveGigaamFromBase(
+  baseUrl: string,
+  config: { version?: unknown; [key: string]: unknown },
+  quantization: string,
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<
+  | { mode: "rnnt"; encoder: string; decoder: string; joint: string; vocabularyText: string }
+  | { mode: "ctc"; ctcModel: string; vocabularyText: string }
+> {
   const version = config.version ?? "v2";
   const vocabName = `${version}_vocab.txt`;
   const vocab = await fetchFirstExistingText(baseUrl, [vocabName, "vocab.txt", "tokens.txt"], fetchImpl, headers);
@@ -141,19 +207,19 @@ async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, h
       modelFilenameCandidates(`${prefix}_encoder.onnx`, quantization),
       fetchImpl,
       headers,
-    ).catch(() => null);
+    ).catch((): null => null);
     const decoder = await resolveFirstExistingUrl(
       baseUrl,
       modelFilenameCandidates(`${prefix}_decoder.onnx`, quantization),
       fetchImpl,
       headers,
-    ).catch(() => null);
+    ).catch((): null => null);
     const joint = await resolveFirstExistingUrl(
       baseUrl,
       modelFilenameCandidates(`${prefix}_joint.onnx`, quantization),
       fetchImpl,
       headers,
-    ).catch(() => null);
+    ).catch((): null => null);
 
     if (encoder && decoder && joint) {
       return {
@@ -173,7 +239,7 @@ async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, h
       modelFilenameCandidates(candidate, quantization),
       fetchImpl,
       headers,
-    ).catch(() => null);
+    ).catch((): null => null);
     if (model) {
       return {
         mode: "ctc",
@@ -186,19 +252,27 @@ async function resolveGigaamFromBase(baseUrl, config, quantization, fetchImpl, h
   throw new Error("Could not resolve GigaAM RNNT or CTC model files.");
 }
 
-async function resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, headers) {
+async function resolveNemoConformerFromBase(
+  baseUrl: string,
+  quantization: string,
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<
+  | { mode: "rnnt"; encoder: string; decoderJoint: string }
+  | { mode: "ctc"; ctcModel: string }
+> {
   const encoder = await resolveFirstExistingUrl(
     baseUrl,
     modelFilenameCandidates("encoder-model.onnx", quantization),
     fetchImpl,
     headers,
-  ).catch(() => null);
+  ).catch((): null => null);
   const decoderJoint = await resolveFirstExistingUrl(
     baseUrl,
     modelFilenameCandidates("decoder_joint-model.onnx", quantization),
     fetchImpl,
     headers,
-  ).catch(() => null);
+  ).catch((): null => null);
 
   if (encoder && decoderJoint) {
     return { mode: "rnnt", encoder, decoderJoint };
@@ -209,7 +283,7 @@ async function resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, he
     modelFilenameCandidates("model.onnx", quantization),
     fetchImpl,
     headers,
-  ).catch(() => null);
+  ).catch((): null => null);
   if (ctcModel) {
     return { mode: "ctc", ctcModel };
   }
@@ -217,12 +291,17 @@ async function resolveNemoConformerFromBase(baseUrl, quantization, fetchImpl, he
   throw new Error("Could not resolve nemo-conformer RNNT or CTC artifacts.");
 }
 
-async function resolveSherpaFromBase(baseUrl, quantization, fetchImpl, headers) {
+async function resolveSherpaFromBase(
+  baseUrl: string,
+  quantization: string,
+  fetchImpl: typeof fetch,
+  headers?: HeadersMap,
+): Promise<{ encoder: string; decoder: string; joiner: string; tokensText: string } | null> {
   const amOnnxProbe = modelFilenameCandidates("am-onnx/encoder.onnx", quantization);
   const amProbe = modelFilenameCandidates("am/encoder.onnx", quantization);
   const amDir = await resolveFirstExistingUrl(baseUrl, [...amOnnxProbe, ...amProbe], fetchImpl, headers)
-    .then((url) => (url.includes("/am-onnx/") ? "am-onnx" : "am"))
-    .catch(() => null);
+    .then((url): "am-onnx" | "am" => (url.includes("/am-onnx/") ? "am-onnx" : "am"))
+    .catch((): null => null);
   if (!amDir) {
     return null;
   }
@@ -251,18 +330,21 @@ async function resolveSherpaFromBase(baseUrl, quantization, fetchImpl, headers) 
   return { encoder, decoder, joiner, tokensText };
 }
 
-function vadModelCandidates(quantization = "int8") {
+function vadModelCandidates(quantization = "int8"): string[] {
   if (quantization && quantization !== "none" && quantization !== "float32" && quantization !== "fp32") {
     return [`onnx/model_${quantization}.onnx`, "onnx/model.onnx", "model.onnx"];
   }
   return ["onnx/model.onnx", "onnx/model_int8.onnx", "model.onnx"];
 }
 
-function resolveVadOption(options = {}) {
+function resolveVadOption(options: BrowserModelLoadOptions = {}): VadDetector | null {
   return options.vadModel ?? options.vad ?? null;
 }
 
-function attachVadIfProvided(asrModel, options = {}) {
+function attachVadIfProvided(
+  asrModel: AsrTranscriber,
+  options: BrowserModelLoadOptions = {},
+): AsrTranscriber {
   const vadModel = resolveVadOption(options);
   if (!vadModel) {
     return asrModel;
@@ -270,12 +352,16 @@ function attachVadIfProvided(asrModel, options = {}) {
   return withVadModel(asrModel, vadModel, options.vadOptions);
 }
 
-async function createAsrModelWithVad(params, options = {}) {
+async function createAsrModelWithVad(
+  params: Record<string, unknown>,
+  options: BrowserModelLoadOptions = {},
+): Promise<AsrTranscriber> {
   const asrModel = await createAsrModel(params);
   return attachVadIfProvided(asrModel, options);
 }
 
-export async function loadLocalVadModel(baseUrl, options = {}) {
+/** Load a VAD model from a browser-accessible base URL. */
+export async function loadLocalVadModel(baseUrl: string, options: BrowserModelLoadOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
@@ -291,7 +377,8 @@ export async function loadLocalVadModel(baseUrl, options = {}) {
   });
 }
 
-export async function loadLocalModel(baseUrl, options = {}) {
+/** Load an ASR model from a browser-accessible base URL. */
+export async function loadLocalModel(baseUrl: string, options: BrowserModelLoadOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
@@ -347,9 +434,11 @@ export async function loadLocalModel(baseUrl, options = {}) {
   }
 
   if (spec.decoderKind === "whisper-hf") {
+    const encoderPath = requireString(spec.encoder, "whisper config is missing encoder model path.");
+    const decoderPath = requireString(spec.decoderJoint, "whisper config is missing decoder model path.");
     const [encoderModel, decoderJointModel, vocabJson, hasAddedTokens] = await Promise.all([
-      resolveModelUrl(baseUrl, spec.encoder, { fetchImpl, headers, quantization }),
-      resolveModelUrl(baseUrl, spec.decoderJoint, { fetchImpl, headers, quantization }),
+      resolveModelUrl(baseUrl, encoderPath, { fetchImpl, headers, quantization }),
+      resolveModelUrl(baseUrl, decoderPath, { fetchImpl, headers, quantization }),
       fetchText(joinUrl(baseUrl, "vocab.json"), fetchImpl, headers),
       probeUrl(joinUrl(baseUrl, "added_tokens.json"), fetchImpl, headers),
     ]);
@@ -425,7 +514,11 @@ export async function loadLocalModel(baseUrl, options = {}) {
   }
 
   const [encoderModel, decoderJointModel, vocabularyText, preprocessorModel] = await Promise.all([
-    resolveModelUrl(baseUrl, spec.encoder, { fetchImpl, headers, quantization }),
+    resolveModelUrl(
+      baseUrl,
+      requireString(spec.encoder, `model type '${modelType}' is missing encoder path.`),
+      { fetchImpl, headers, quantization },
+    ),
     spec.decoderJoint
       ? resolveModelUrl(baseUrl, spec.decoderJoint, { fetchImpl, headers, quantization })
       : Promise.resolve(null),
@@ -457,7 +550,8 @@ export async function loadLocalModel(baseUrl, options = {}) {
   }, options);
 }
 
-export async function loadHuggingfaceModel(repoId, options = {}) {
+/** Load an ASR model by Hugging Face repo id directly in browser. */
+export async function loadHuggingfaceModel(repoId: string, options: BrowserModelLoadOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
@@ -506,7 +600,8 @@ export async function loadHuggingfaceModel(repoId, options = {}) {
   return loadLocalModel(baseUrl, { ...options, headers, fetch: fetchImpl });
 }
 
-export async function loadHuggingfaceVadModel(repoId, options = {}) {
+/** Load a VAD model by Hugging Face repo id directly in browser. */
+export async function loadHuggingfaceVadModel(repoId: string, options: BrowserModelLoadOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");

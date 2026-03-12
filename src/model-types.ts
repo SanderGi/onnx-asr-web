@@ -1,4 +1,40 @@
-export const MODEL_TYPES = {
+export interface ModelSpec {
+  decoderKind: string;
+  preprocessor?: string | null;
+  encoder?: string | null;
+  decoderJoint?: string | null;
+  vocabCandidates: string[];
+  whisperModelPattern?: RegExp;
+}
+
+export interface ModelConfig {
+  model_type?: string;
+  version?: string;
+  features_size?: number;
+  num_mel_bins?: number;
+  subsampling_factor?: number;
+  max_tokens_per_step?: number;
+  max_sequence_length?: number;
+  sample_rate?: number;
+  feature_extraction_params?: {
+    sample_rate?: number;
+    n_mels?: number;
+    n_fft?: number;
+    window_size?: number;
+    window_stride?: number;
+    preemphasis_coefficient?: number;
+    [key: string]: unknown;
+  };
+  architectures?: string[];
+  decoder_params?: {
+    vocabulary?: string[];
+    [key: string]: unknown;
+  };
+  pad_token_id?: number;
+  [key: string]: unknown;
+}
+
+export const MODEL_TYPES: Record<string, ModelSpec> = {
   "nemo-conformer-tdt": {
     decoderKind: "tdt",
     preprocessor: "nemo128.onnx",
@@ -46,6 +82,7 @@ export const MODEL_TYPES = {
     preprocessor: null,
     encoder: null,
     decoderJoint: null,
+    vocabCandidates: [],
     whisperModelPattern: /_beamsearch(?:\\.int8)?\\.onnx$/,
   },
   whisper: {
@@ -64,7 +101,8 @@ export const MODEL_TYPES = {
   },
 };
 
-export function parseConfigText(configText) {
+/** Parse a model `config.json` payload into an object. */
+export function parseConfigText(configText: string): ModelConfig {
   let parsed;
   try {
     parsed = JSON.parse(configText);
@@ -76,10 +114,11 @@ export function parseConfigText(configText) {
     throw new Error("Invalid config.json: expected a JSON object.");
   }
 
-  return parsed;
+  return parsed as ModelConfig;
 }
 
-export function detectModelType(config) {
+/** Detect model family/runtime spec from parsed config. */
+export function detectModelType(config: ModelConfig): { modelType: string; spec: ModelSpec } {
   const modelType = config?.model_type;
   if (!modelType || typeof modelType !== "string") {
     const architectures = Array.isArray(config?.architectures) ? config.architectures : [];
@@ -97,7 +136,8 @@ export function detectModelType(config) {
   return { modelType, spec };
 }
 
-export function toneVocabularyTextFromConfig(config) {
+/** Build Tone CTC vocabulary text from config when available. */
+export function toneVocabularyTextFromConfig(config: ModelConfig): string | null {
   const vocab = config?.decoder_params?.vocabulary;
   if (!Array.isArray(vocab) || vocab.length === 0) {
     return null;

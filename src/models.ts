@@ -1,14 +1,87 @@
 import * as ort from "onnxruntime-web";
+import type { ModelConfig } from "./model-types.js";
+import type { OrtTensor, TensorData, TensorMap, TokenFrame } from "./types.js";
 import { firstExistingInputName, int64TensorValues, readScalarInt } from "./utils.js";
 
-function intTensor(type, values, dims) {
+type TensorShape = readonly number[];
+type MetadataShape = readonly (number | string | undefined)[] | undefined;
+type EncoderLayout = "BCT" | "BTV" | "BVT";
+type TensorMetadata = { name: string; type?: string; shape?: MetadataShape };
+
+interface LogMelSpectrogramOptions {
+  sampleRate?: number;
+  nMels?: number;
+  nFft?: number;
+  winLength?: number;
+  hopLength?: number;
+  fMin?: number;
+  fMax?: number;
+  logEps?: number;
+  preemphasis?: number;
+  normalize?: boolean;
+}
+
+interface EncoderModelOptions {
+  config?: ModelConfig;
+  sampleRate?: number;
+}
+
+interface DecoderTransducerOptions {
+  decoderKind?: "tdt" | "rnnt";
+  vocabSize?: number;
+}
+
+interface TransducerCandidate {
+  token: number;
+  duration: number;
+}
+
+interface DecoderPrediction {
+  candidates: TransducerCandidate[];
+  nextStates: Map<string, OrtTensor>;
+}
+
+interface EncodedAudio {
+  encodedData: TensorData;
+  encodedDims: TensorShape;
+  encodedLayout: EncoderLayout;
+  encodedLength: number;
+}
+
+interface DecoderResult {
+  tokenIds: number[];
+  tokenFrames: TokenFrame[];
+  totalFrames: number;
+}
+
+interface TransducerDecoderLike {
+  initialStates(): Map<string, OrtTensor>;
+  predict(
+    encoderFrameData: Float32Array,
+    encoderFrameDims: TensorShape,
+    token: number,
+    states: Map<string, OrtTensor>,
+  ): Promise<DecoderPrediction>;
+}
+
+interface TransducerGreedyDecoderOptions {
+  maxSymbols?: number;
+  blankTokenId?: number;
+  defaultDuration?: number;
+}
+
+interface CtcGreedyDecoderOptions {
+  blankTokenId?: number;
+}
+
+function intTensor(type: string, values: readonly number[], dims: readonly number[]): ort.Tensor {
   if (type === "int64") {
     return new ort.Tensor("int64", int64TensorValues(values), dims);
   }
   return new ort.Tensor("int32", Int32Array.from(values), dims);
 }
 
-function ensureOutput(session, outputMap, index) {
+function ensureOutput(session: ort.InferenceSession, outputMap: TensorMap, index: number): OrtTensor {
   const name = session.outputNames[index];
   const tensor = outputMap[name];
   if (!tensor) {
@@ -17,15 +90,21 @@ function ensureOutput(session, outputMap, index) {
   return tensor;
 }
 
-function valueToNumber(value) {
-  return typeof value === "bigint" ? Number(value) : value;
+function valueToNumber(value: string | number | bigint): number {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "string") {
+    return Number(value);
+  }
+  return value;
 }
 
-function numbersFromTensor(tensor) {
-  return Array.from(tensor.data, valueToNumber);
+function numbersFromTensor(tensor: OrtTensor): number[] {
+  return Array.from(tensor.data as ArrayLike<string | number | bigint>, valueToNumber);
 }
 
-function shapeFromMetadata(metadataShape) {
+function shapeFromMetadata(metadataShape: MetadataShape): number[] {
   if (!Array.isArray(metadataShape) || metadataShape.length === 0) {
     return [1];
   }
@@ -35,19 +114,19 @@ function shapeFromMetadata(metadataShape) {
   );
 }
 
-function product(values) {
+function product(values: readonly number[]): number {
   return values.reduce((acc, value) => acc * value, 1);
 }
 
-function hzToMel(hz) {
+function hzToMel(hz: number): number {
   return 2595 * Math.log10(1 + hz / 700);
 }
 
-function melToHz(mel) {
+function melToHz(mel: number): number {
   return 700 * (10 ** (mel / 2595) - 1);
 }
 
-function buildHannWindow(length) {
+function buildHannWindow(length: number): Float32Array {
   const window = new Float32Array(length);
   if (length === 1) {
     window[0] = 1;
@@ -59,7 +138,9 @@ function buildHannWindow(length) {
   return window;
 }
 
-function buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax }) {
+function buildMelFilterBank(
+  { sampleRate, nFft, nMels, fMin, fMax }: Required<Pick<LogMelSpectrogramOptions, "sampleRate" | "nFft" | "nMels" | "fMin" | "fMax">>,
+): Float32Array[] {
   const nFreqs = Math.floor(nFft / 2) + 1;
   const bank = Array.from({ length: nMels }, () => new Float32Array(nFreqs));
 
@@ -93,7 +174,7 @@ function buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax }) {
   return bank;
 }
 
-function powerSpectrum(frame, nFft) {
+function powerSpectrum(frame: Float32Array, nFft: number): Float32Array {
   const bins = Math.floor(nFft / 2) + 1;
   const out = new Float32Array(bins);
 
@@ -112,7 +193,7 @@ function powerSpectrum(frame, nFft) {
   return out;
 }
 
-function logMelSpectrogram(samples, options = {}) {
+function logMelSpectrogram(samples: Float32Array, options: LogMelSpectrogramOptions = {}) {
   const sampleRate = options.sampleRate ?? 16000;
   const nMels = options.nMels ?? 80;
   const nFft = options.nFft ?? 512;
@@ -197,15 +278,20 @@ function logMelSpectrogram(samples, options = {}) {
 }
 
 export class PreprocessorModel {
-  constructor(session) {
+  readonly session: ort.InferenceSession;
+  readonly inputSignalName: string;
+  readonly lengthName: string;
+  readonly lengthType: string;
+
+  constructor(session: ort.InferenceSession) {
     this.session = session;
     this.inputSignalName = firstExistingInputName(session, ["input_signal", "waveforms"], 0);
     this.lengthName = firstExistingInputName(session, ["length", "waveforms_lens"], 1);
 
-    this.lengthType = session.inputMetadata.find((item) => item.name === this.lengthName)?.type ?? "int64";
+    this.lengthType = (session.inputMetadata.find((item) => item.name === this.lengthName) as TensorMetadata | undefined)?.type ?? "int64";
   }
 
-  async run(audioSamples) {
+  async run(audioSamples: Float32Array): Promise<{ signal: OrtTensor; length: OrtTensor }> {
     const audioTensor = new ort.Tensor("float32", audioSamples, [1, audioSamples.length]);
     const lengthTensor = intTensor(this.lengthType, [audioSamples.length], [1]);
 
@@ -222,17 +308,24 @@ export class PreprocessorModel {
 }
 
 export class EncoderModel {
-  constructor(session, options = {}) {
+  readonly session: ort.InferenceSession;
+  readonly options: EncoderModelOptions;
+  readonly audioSignalName: string;
+  readonly lengthName: string;
+  readonly audioMetadata: TensorMetadata | undefined;
+  readonly lengthMetadata: TensorMetadata | undefined;
+
+  constructor(session: ort.InferenceSession, options: EncoderModelOptions = {}) {
     this.session = session;
     this.options = options;
     this.audioSignalName = firstExistingInputName(session, ["audio_signal", "features", "waveforms"], 0);
     this.lengthName = firstExistingInputName(session, ["length", "features_lens", "waveforms_lens"], 1);
 
-    this.audioMetadata = session.inputMetadata.find((item) => item.name === this.audioSignalName);
-    this.lengthMetadata = session.inputMetadata.find((item) => item.name === this.lengthName);
+    this.audioMetadata = session.inputMetadata.find((item) => item.name === this.audioSignalName) as TensorMetadata | undefined;
+    this.lengthMetadata = session.inputMetadata.find((item) => item.name === this.lengthName) as TensorMetadata | undefined;
   }
 
-  prepareInputsFromWaveform(samples) {
+  prepareInputsFromWaveform(samples: Float32Array): { signal: OrtTensor; length: OrtTensor } {
     const inputRank = this.audioMetadata?.shape?.length ?? 2;
     if (inputRank === 2) {
       const audioTensor = new ort.Tensor("float32", samples, [1, samples.length]);
@@ -248,7 +341,9 @@ export class EncoderModel {
     const nMelsFromShape = this.audioMetadata?.shape?.[1];
     const fe = this.options.config?.feature_extraction_params;
     const configNels = this.options.config?.features_size ?? fe?.n_mels;
-    const nMels = Number.isFinite(nMelsFromShape) ? nMelsFromShape : configNels ?? 80;
+    const nMels = typeof nMelsFromShape === "number" && Number.isFinite(nMelsFromShape)
+      ? nMelsFromShape
+      : configNels ?? 80;
     const isGigaam = this.options.config?.model_type === "gigaam";
     const sampleRate = this.options.sampleRate ?? fe?.sample_rate ?? 16000;
     const nFft = fe?.n_fft ?? 512;
@@ -274,7 +369,7 @@ export class EncoderModel {
     return { signal: audioTensor, length: lengthTensor };
   }
 
-  async run(processedSignalTensor, processedLengthTensor) {
+  async run(processedSignalTensor: OrtTensor, processedLengthTensor: OrtTensor): Promise<EncodedAudio> {
     const outputs = await this.session.run({
       [this.audioSignalName]: processedSignalTensor,
       [this.lengthName]: processedLengthTensor,
@@ -299,12 +394,14 @@ export class EncoderModel {
 }
 
 export class CtcAcousticModel extends EncoderModel {
-  constructor(session, options = {}) {
+  readonly vocabSize?: number;
+
+  constructor(session: ort.InferenceSession, options: EncoderModelOptions & { vocabSize?: number } = {}) {
     super(session, options);
     this.vocabSize = options.vocabSize;
   }
 
-  async run(processedSignalTensor, processedLengthTensor) {
+  async run(processedSignalTensor: OrtTensor, processedLengthTensor: OrtTensor): Promise<EncodedAudio> {
     const outputs = await this.session.run({
       [this.audioSignalName]: processedSignalTensor,
       [this.lengthName]: processedLengthTensor,
@@ -330,7 +427,7 @@ export class CtcAcousticModel extends EncoderModel {
       throw new Error(`Unexpected CTC batch layout: [${logits.dims.join(", ")}].`);
     }
 
-    let layout = "BTV";
+    let layout: EncoderLayout = "BTV";
     if (this.vocabSize && d1 === this.vocabSize && d2 !== this.vocabSize) {
       layout = "BVT";
     } else if (this.vocabSize && d2 === this.vocabSize) {
@@ -347,7 +444,19 @@ export class CtcAcousticModel extends EncoderModel {
 }
 
 export class DecoderTransducerModel {
-  constructor(session, options = {}) {
+  readonly session: ort.InferenceSession;
+  readonly decoderKind: "tdt" | "rnnt";
+  readonly vocabSize?: number;
+  readonly encoderOutputsName: string;
+  readonly targetsName: string;
+  readonly targetLengthName: string | null;
+  readonly targetsType: string;
+  readonly targetLengthType: string;
+  readonly stateInputNames: string[];
+  readonly stateInputMetadata: TensorMetadata[];
+  readonly stateOutputNames: string[];
+
+  constructor(session: ort.InferenceSession, options: DecoderTransducerOptions = {}) {
     this.session = session;
     this.decoderKind = options.decoderKind ?? "tdt";
     this.vocabSize = options.vocabSize;
@@ -358,9 +467,9 @@ export class DecoderTransducerModel {
       ? "target_length"
       : null;
 
-    this.targetsType = session.inputMetadata.find((item) => item.name === this.targetsName)?.type ?? "int32";
+    this.targetsType = (session.inputMetadata.find((item) => item.name === this.targetsName) as TensorMetadata | undefined)?.type ?? "int32";
     this.targetLengthType = this.targetLengthName
-      ? session.inputMetadata.find((item) => item.name === this.targetLengthName)?.type ?? "int32"
+      ? (session.inputMetadata.find((item) => item.name === this.targetLengthName) as TensorMetadata | undefined)?.type ?? "int32"
       : "int32";
 
     this.stateInputNames = session.inputNames.filter(
@@ -368,7 +477,7 @@ export class DecoderTransducerModel {
     );
 
     this.stateInputMetadata = this.stateInputNames.map((name) => {
-      const meta = session.inputMetadata.find((item) => item.name === name);
+      const meta = session.inputMetadata.find((item) => item.name === name) as TensorMetadata | undefined;
       if (!meta) {
         throw new Error(`Missing input metadata for decoder state '${name}'.`);
       }
@@ -381,7 +490,7 @@ export class DecoderTransducerModel {
       : session.outputNames.slice(1).filter((name) => !/length/i.test(name));
   }
 
-  initialStates() {
+  initialStates(): Map<string, OrtTensor> {
     const states = new Map();
     for (const meta of this.stateInputMetadata) {
       const shape = shapeFromMetadata(meta.shape);
@@ -394,7 +503,7 @@ export class DecoderTransducerModel {
     return states;
   }
 
-  resolveNextStates(outputs, currentStates) {
+  resolveNextStates(outputs: TensorMap, currentStates: Map<string, OrtTensor>): Map<string, OrtTensor> {
     const nextStates = new Map();
     for (let i = 0; i < this.stateInputNames.length; i += 1) {
       const inputName = this.stateInputNames[i];
@@ -408,11 +517,11 @@ export class DecoderTransducerModel {
     return nextStates;
   }
 
-  argmax(data, start, end) {
+  argmax(data: TensorData, start: number, end: number): number {
     let maxValue = -Infinity;
     let maxIndex = start;
     for (let i = start; i < end; i += 1) {
-      const value = data[i];
+      const value = valueToNumber(data[i]);
       if (value > maxValue) {
         maxValue = value;
         maxIndex = i;
@@ -421,7 +530,7 @@ export class DecoderTransducerModel {
     return maxIndex;
   }
 
-  rnntCandidates(mainOutputTensor) {
+  rnntCandidates(mainOutputTensor: OrtTensor): TransducerCandidate[] {
     if (mainOutputTensor.type === "int32" || mainOutputTensor.type === "int64") {
       return numbersFromTensor(mainOutputTensor).map((token) => ({ token, duration: 0 }));
     }
@@ -430,7 +539,7 @@ export class DecoderTransducerModel {
     return [{ token: this.argmax(flat, 0, flat.length), duration: 0 }];
   }
 
-  tdtCandidates(mainOutputTensor) {
+  tdtCandidates(mainOutputTensor: OrtTensor): TransducerCandidate[] {
     if (!this.vocabSize || this.vocabSize <= 0) {
       throw new Error("TDT decoder requires a positive vocabSize.");
     }
@@ -449,7 +558,12 @@ export class DecoderTransducerModel {
     return [{ token, duration }];
   }
 
-  async predict(encoderFrameData, encoderFrameDims, token, states) {
+  async predict(
+    encoderFrameData: Float32Array,
+    encoderFrameDims: TensorShape,
+    token: number,
+    states: Map<string, OrtTensor>,
+  ): Promise<DecoderPrediction> {
     const feeds = {
       [this.encoderOutputsName]: new ort.Tensor("float32", encoderFrameData, encoderFrameDims),
       [this.targetsName]: intTensor(this.targetsType, [token], [1, 1]),
@@ -480,14 +594,19 @@ export class DecoderTransducerModel {
 }
 
 export class TransducerGreedyDecoder {
-  constructor(model, options = {}) {
+  readonly model: TransducerDecoderLike;
+  readonly maxSymbols: number;
+  readonly blankTokenId: number;
+  readonly defaultDuration: number;
+
+  constructor(model: TransducerDecoderLike, options: TransducerGreedyDecoderOptions = {}) {
     this.model = model;
     this.maxSymbols = options.maxSymbols ?? 10;
     this.blankTokenId = options.blankTokenId ?? 0;
     this.defaultDuration = options.defaultDuration ?? 1;
   }
 
-  frameAt(encodedData, encodedDims, encodedLayout, t) {
+  frameAt(encodedData: TensorData, encodedDims: TensorShape, encodedLayout: EncoderLayout, t: number) {
     if (encodedLayout === "BCT") {
       const channels = encodedDims[1];
       const time = encodedDims[2];
@@ -497,7 +616,7 @@ export class TransducerGreedyDecoder {
 
       const frame = new Float32Array(channels);
       for (let c = 0; c < channels; c += 1) {
-        frame[c] = encodedData[c * time + t];
+        frame[c] = valueToNumber(encodedData[c * time + t]);
       }
       return { data: frame, dims: [1, channels, 1] };
     }
@@ -505,9 +624,14 @@ export class TransducerGreedyDecoder {
     throw new Error(`Unsupported encoder layout: ${encodedLayout}`);
   }
 
-  async decode(encodedData, encodedDims, encodedLayout, encodedLength) {
-    const tokenIds = [];
-    const tokenFrames = [];
+  async decode(
+    encodedData: TensorData,
+    encodedDims: TensorShape,
+    encodedLayout: EncoderLayout,
+    encodedLength: number,
+  ): Promise<DecoderResult> {
+    const tokenIds: number[] = [];
+    const tokenFrames: TokenFrame[] = [];
     let currentToken = this.blankTokenId;
     let states = this.model.initialStates();
     let t = 0;
@@ -566,15 +690,17 @@ export class TransducerGreedyDecoder {
 }
 
 export class CtcGreedyDecoder {
-  constructor(options = {}) {
+  readonly blankTokenId: number;
+
+  constructor(options: CtcGreedyDecoderOptions = {}) {
     this.blankTokenId = options.blankTokenId ?? 0;
   }
 
-  argmaxAt(data, start, size) {
+  argmaxAt(data: TensorData, start: number, size: number): number {
     let best = 0;
     let bestValue = -Infinity;
     for (let i = 0; i < size; i += 1) {
-      const value = data[start + i];
+      const value = valueToNumber(data[start + i]);
       if (value > bestValue) {
         bestValue = value;
         best = i;
@@ -583,9 +709,14 @@ export class CtcGreedyDecoder {
     return best;
   }
 
-  async decode(encodedData, encodedDims, encodedLayout, encodedLength) {
-    const tokenIds = [];
-    const tokenFrames = [];
+  async decode(
+    encodedData: TensorData,
+    encodedDims: TensorShape,
+    encodedLayout: EncoderLayout,
+    encodedLength: number,
+  ): Promise<DecoderResult> {
+    const tokenIds: number[] = [];
+    const tokenFrames: TokenFrame[] = [];
     let previous = this.blankTokenId;
 
     const timeSteps = encodedLayout === "BVT" ? encodedDims[2] : encodedDims[1];
@@ -598,7 +729,7 @@ export class CtcGreedyDecoder {
         let best = 0;
         let bestValue = -Infinity;
         for (let v = 0; v < vocabSize; v += 1) {
-          const value = encodedData[v * timeSteps + t];
+          const value = valueToNumber(encodedData[v * timeSteps + t]);
           if (value > bestValue) {
             bestValue = value;
             best = v;

@@ -1,5 +1,19 @@
 import * as ort from "onnxruntime-web";
 import { decodeWav, normalize, resampleLinear } from "./audio.js";
+import type { ModelConfig } from "./model-types.js";
+import type {
+  AsrTranscriber,
+  AudioSamples,
+  ConfigureOrtWebOptions,
+  DecoderOptions,
+  OrtTensor,
+  SessionOptions,
+  TensorData,
+  TensorMap,
+  TokenFrame,
+  TranscriptResult,
+  WordTimestamp,
+} from "./types.js";
 import {
   CtcAcousticModel,
   CtcGreedyDecoder,
@@ -10,7 +24,120 @@ import {
 } from "./models.js";
 import { WhisperHfModel, WhisperOrtModel } from "./whisper.js";
 
-export function configureOrtWeb(options = {}) {
+type TokenVocabulary = string[];
+type EncoderLayout = "BCT" | "BTV" | "BVT";
+type TensorMetadata = { name: string; type?: string; shape?: readonly (number | string | undefined)[] };
+type DecoderKind =
+  | "whisper-ort"
+  | "whisper-hf"
+  | "aed"
+  | "gigaam-rnnt"
+  | "tone-ctc"
+  | "sherpa-transducer"
+  | "ctc"
+  | "rnnt"
+  | "tdt"
+  | "nemo-conformer";
+
+interface DecoderResult {
+  tokenIds: number[];
+  tokenFrames: TokenFrame[];
+  totalFrames: number;
+}
+
+interface EncodedAudio {
+  encodedData: TensorData;
+  encodedDims: readonly number[];
+  encodedLayout: EncoderLayout;
+  encodedLength: number;
+}
+
+interface EncoderInputs {
+  signal: OrtTensor;
+  length: OrtTensor;
+}
+
+interface EncoderLike {
+  audioSignalName: string;
+  lengthName: string;
+  prepareInputsFromWaveform(samples: Float32Array): EncoderInputs;
+  run(signal: OrtTensor, length: OrtTensor): Promise<EncodedAudio>;
+}
+
+interface PreprocessorLike {
+  run(audioSamples: Float32Array): Promise<EncoderInputs>;
+}
+
+interface DecoderLike {
+  decode(
+    encodedData: TensorData,
+    encodedDims: readonly number[],
+    encodedLayout: EncoderLayout,
+    encodedLength: number,
+  ): Promise<DecoderResult>;
+}
+
+interface ShapeOptions {
+  batch?: number;
+}
+
+interface CanaryOptions {
+  language?: string;
+  targetLanguage?: string;
+  pnc?: "yes" | "no";
+}
+
+interface AsrModelOptions {
+  preprocessor?: PreprocessorLike | null;
+  encoder: EncoderLike;
+  decoder: DecoderLike;
+  tokens: TokenVocabulary;
+  sampleRate?: number;
+}
+
+interface SessionBundleOptions {
+  config?: ModelConfig;
+  tokens: TokenVocabulary;
+  encoderSession: ort.InferenceSession;
+  decoderSession: ort.InferenceSession;
+}
+
+interface GigaamModelOptions extends SessionBundleOptions {
+  jointSession: ort.InferenceSession;
+}
+
+interface ToneModelOptions {
+  config?: ModelConfig;
+  tokens: TokenVocabulary;
+  session: ort.InferenceSession;
+}
+
+interface SherpaModelOptions {
+  config?: ModelConfig;
+  tokens: TokenVocabulary;
+  encoderSession: ort.InferenceSession;
+  decoderSession: ort.InferenceSession;
+  joinerSession: ort.InferenceSession;
+}
+
+interface CreateAsrModelOptions {
+  modelType?: string;
+  decoderKind?: DecoderKind | string;
+  config?: ModelConfig;
+  preprocessorModel?: string | null;
+  encoderModel?: string | null;
+  decoderModel?: string | null;
+  decoderJointModel?: string | null;
+  whisperModel?: string | null;
+  vocabularyText?: string | null;
+  vocabJson?: string | null;
+  addedTokensJson?: string | null;
+  sessionOptions?: SessionOptions;
+  decoderOptions?: DecoderOptions;
+}
+
+/** Configure ONNX Runtime Web global environment settings. */
+export function configureOrtWeb(options: ConfigureOrtWebOptions = {}): void {
   if (options.numThreads != null) {
     ort.env.wasm.numThreads = options.numThreads;
   }
@@ -25,7 +152,7 @@ export function configureOrtWeb(options = {}) {
   }
 }
 
-function parseVocabulary(vocabularyText) {
+function parseVocabulary(vocabularyText: string): TokenVocabulary {
   const lines = vocabularyText
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -35,6 +162,9 @@ function parseVocabulary(vocabularyText) {
   if (indexed) {
     const parsed = lines.map((line) => {
       const match = line.match(/^(.*)\s+(\d+)$/);
+      if (!match) {
+        throw new Error(`Invalid indexed vocabulary line: ${line}`);
+      }
       return { token: match[1], id: Number(match[2]) };
     });
 
@@ -49,15 +179,32 @@ function parseVocabulary(vocabularyText) {
   return lines;
 }
 
-function isControlToken(token) {
-  return token && token.startsWith("<") && token.endsWith(">");
+function isControlToken(token: string | undefined): boolean {
+  return Boolean(token && token.startsWith("<") && token.endsWith(">"));
 }
 
-function decodeTokenPiece(token) {
-  return token.replaceAll("▁", " ");
+function decodeTokenPiece(token: string): string {
+  return token.split("▁").join(" ");
 }
 
-function decodeText(tokens, tokenIds) {
+function tensorValueToNumber(value: string | number | bigint): number {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "string") {
+    return Number(value);
+  }
+  return value;
+}
+
+function tensorDataToFloat32(data: TensorData): Float32Array {
+  if (data instanceof Float32Array) {
+    return Float32Array.from(data);
+  }
+  return Float32Array.from(Array.from(data as ArrayLike<string | number | bigint>, tensorValueToNumber));
+}
+
+function decodeText(tokens: TokenVocabulary, tokenIds: readonly number[]): string {
   return tokenIds
     .map((tokenId) => tokens[tokenId])
     .filter((token) => token && !isControlToken(token))
@@ -66,9 +213,14 @@ function decodeText(tokens, tokenIds) {
     .trim();
 }
 
-function wordTimestamps(tokens, tokenIds, tokenFrames, secondsPerFrame) {
-  const words = [];
-  let current = null;
+function wordTimestamps(
+  tokens: TokenVocabulary,
+  tokenIds: readonly number[],
+  tokenFrames: readonly TokenFrame[],
+  secondsPerFrame: number,
+): WordTimestamp[] {
+  const words: WordTimestamp[] = [];
+  let current: { text: string; startFrame: number; endFrame: number } | null = null;
 
   const closeCurrent = () => {
     if (!current) {
@@ -121,7 +273,7 @@ function wordTimestamps(tokens, tokenIds, tokenFrames, secondsPerFrame) {
   return words;
 }
 
-function detectBlankTokenId(tokens) {
+function detectBlankTokenId(tokens: TokenVocabulary): number {
   const preferred = ["<blk>", "<blank>"];
   for (const name of preferred) {
     const index = tokens.findIndex((token) => token === name);
@@ -132,8 +284,14 @@ function detectBlankTokenId(tokens) {
   return tokens.length - 1;
 }
 
-export class AsrModel {
-  constructor({ preprocessor, encoder, decoder, tokens, sampleRate = 16000 }) {
+export class AsrModel implements AsrTranscriber {
+  readonly preprocessor: PreprocessorLike | null;
+  readonly encoder: EncoderLike;
+  readonly decoder: DecoderLike;
+  readonly tokens: TokenVocabulary;
+  readonly sampleRate: number;
+
+  constructor({ preprocessor = null, encoder, decoder, tokens, sampleRate = 16000 }: AsrModelOptions) {
     this.preprocessor = preprocessor;
     this.encoder = encoder;
     this.decoder = decoder;
@@ -141,7 +299,7 @@ export class AsrModel {
     this.sampleRate = sampleRate;
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+  async transcribeSamples(samples: AudioSamples, sampleRate = this.sampleRate): Promise<TranscriptResult> {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -181,20 +339,20 @@ export class AsrModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate);
   }
 }
 
-function intTensorFor(type, values, dims) {
+function intTensorFor(type: string, values: readonly number[], dims: readonly number[]): ort.Tensor {
   if (type === "int64") {
     return new ort.Tensor("int64", BigInt64Array.from(values.map((x) => BigInt(x))), dims);
   }
   return new ort.Tensor("int32", Int32Array.from(values), dims);
 }
 
-function zerosTensor(type, shape) {
+function zerosTensor(type: string, shape: readonly number[]): ort.Tensor {
   const size = shape.reduce((acc, value) => acc * value, 1);
   if (type === "float32") {
     return new ort.Tensor("float32", new Float32Array(size), shape);
@@ -205,11 +363,11 @@ function zerosTensor(type, shape) {
   throw new Error(`Unsupported tensor init type '${type}'.`);
 }
 
-function argmaxSlice(data, start, length) {
+function argmaxSlice(data: TensorData, start: number, length: number): number {
   let bestIndex = 0;
   let bestValue = -Infinity;
   for (let i = 0; i < length; i += 1) {
-    const value = data[start + i];
+    const value = tensorValueToNumber(data[start + i]);
     if (value > bestValue) {
       bestValue = value;
       bestIndex = i;
@@ -218,7 +376,7 @@ function argmaxSlice(data, start, length) {
   return bestIndex;
 }
 
-function firstExistingName(names, candidates, fallbackIndex = 0) {
+function firstExistingName(names: readonly string[], candidates: readonly string[], fallbackIndex = 0): string {
   for (const candidate of candidates) {
     if (names.includes(candidate)) {
       return candidate;
@@ -227,13 +385,19 @@ function firstExistingName(names, candidates, fallbackIndex = 0) {
   return names[fallbackIndex];
 }
 
-function metaForName(session, name) {
-  return session.inputMetadata.find((meta) => meta.name === name)
-    ?? session.outputMetadata.find((meta) => meta.name === name)
+function metaForName(
+  session: ort.InferenceSession,
+  name: string,
+) : TensorMetadata | null {
+  return (session.inputMetadata.find((meta) => meta.name === name) as TensorMetadata | undefined)
+    ?? (session.outputMetadata.find((meta) => meta.name === name) as TensorMetadata | undefined)
     ?? null;
 }
 
-function shapeFromMeta(meta, options = {}) {
+function shapeFromMeta(
+  meta: TensorMetadata | null,
+  options: ShapeOptions = {},
+): number[] {
   const batch = options.batch ?? 1;
   return (meta?.shape ?? []).map((dim, idx) => {
     if (typeof dim === "number") {
@@ -249,8 +413,28 @@ function shapeFromMeta(meta, options = {}) {
   });
 }
 
-export class NemoAedModel {
-  constructor({ config, tokens, encoderSession, decoderSession }) {
+export class NemoAedModel implements AsrTranscriber {
+  readonly config?: ModelConfig;
+  readonly tokens: TokenVocabulary;
+  readonly tokenToId: Map<string, number>;
+  readonly encoderSession: ort.InferenceSession;
+  readonly decoderSession: ort.InferenceSession;
+  readonly encoderHelper: EncoderModel;
+  readonly sampleRate: number;
+  readonly maxSequenceLength: number;
+  readonly encoderOutputEmbeddingsName: string;
+  readonly encoderOutputMaskName: string;
+  readonly decoderInputIdName: string;
+  readonly decoderEncoderEmbeddingsName: string;
+  readonly decoderEncoderMaskName: string;
+  readonly decoderMemsName: string;
+  readonly decoderInputIdType: string;
+  readonly decoderMemsType: string;
+  readonly decoderMemsShapeTemplate: readonly (number | string | undefined)[];
+  readonly logitsName: string;
+  readonly decoderHiddenStatesName: string;
+
+  constructor({ config, tokens, encoderSession, decoderSession }: SessionBundleOptions) {
     this.config = config;
     this.tokens = tokens;
     this.tokenToId = new Map();
@@ -287,14 +471,19 @@ export class NemoAedModel {
       ? "decoder_mems"
       : decoderSession.inputNames[3];
 
+    const inputIdMeta = decoderSession.inputMetadata.find(
+      (meta) => meta.name === this.decoderInputIdName,
+    ) as TensorMetadata | undefined;
     this.decoderInputIdType =
-      decoderSession.inputMetadata.find((meta) => meta.name === this.decoderInputIdName)?.type ?? "int32";
-    const memMeta = decoderSession.inputMetadata.find((meta) => meta.name === this.decoderMemsName);
+      inputIdMeta?.type ?? "int32";
+    const memMeta = decoderSession.inputMetadata.find(
+      (meta) => meta.name === this.decoderMemsName,
+    ) as TensorMetadata | undefined;
     if (!memMeta) {
       throw new Error("Decoder input metadata for decoder_mems is missing.");
     }
-    this.decoderMemsType = memMeta.type;
-    this.decoderMemsShapeTemplate = memMeta.shape;
+    this.decoderMemsType = memMeta.type ?? "float32";
+    this.decoderMemsShapeTemplate = memMeta.shape ?? [1, 1, 0, 1];
 
     this.logitsName = decoderSession.outputNames.includes("logits")
       ? "logits"
@@ -304,7 +493,7 @@ export class NemoAedModel {
       : decoderSession.outputNames[1];
   }
 
-  canaryPrefix(options = {}) {
+  canaryPrefix(options: CanaryOptions = {}): number[] {
     const fallbackLanguage = options.language ?? "en";
     const targetLanguage = options.targetLanguage ?? "en";
     const pnc = options.pnc ?? "yes";
@@ -330,7 +519,7 @@ export class NemoAedModel {
     });
   }
 
-  initialMems(batchSize) {
+  initialMems(batchSize: number): ort.Tensor {
     const shape = this.decoderMemsShapeTemplate.map((dim, index) => {
       if (typeof dim === "number") {
         return dim;
@@ -346,7 +535,11 @@ export class NemoAedModel {
     return zerosTensor(this.decoderMemsType, shape);
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate, options = {}) {
+  async transcribeSamples(
+    samples: AudioSamples,
+    sampleRate = this.sampleRate,
+    options: CanaryOptions = {},
+  ): Promise<TranscriptResult> {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -426,14 +619,36 @@ export class NemoAedModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer, options = {}) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer, options: CanaryOptions = {}): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate, options);
   }
 }
 
-export class GigaamRnntModel {
-  constructor({ config, tokens, encoderSession, decoderSession, jointSession }) {
+export class GigaamRnntModel implements AsrTranscriber {
+  readonly config?: ModelConfig;
+  readonly tokens: TokenVocabulary;
+  readonly encoderSession: ort.InferenceSession;
+  readonly decoderSession: ort.InferenceSession;
+  readonly jointSession: ort.InferenceSession;
+  readonly sampleRate: number;
+  readonly encoderHelper: EncoderModel;
+  readonly blankTokenId: number;
+  readonly maxTokensPerStep: number;
+  readonly decoderTargetName: string;
+  readonly decoderTargetLengthName: string | null;
+  readonly decoderTargetType: string;
+  readonly decoderTargetLengthType: string;
+  readonly decoderStateInputNames: string[];
+  readonly decoderVectorOutputName: string;
+  readonly decoderStateOutputNames: string[];
+  readonly jointEncoderInputName: string;
+  readonly jointDecoderInputName: string;
+  readonly jointOutputName: string;
+  readonly jointEncoderShape: readonly (number | string | undefined)[];
+  readonly jointDecoderShape: readonly (number | string | undefined)[];
+
+  constructor({ config, tokens, encoderSession, decoderSession, jointSession }: GigaamModelOptions) {
     this.config = config;
     this.tokens = tokens;
     this.encoderSession = encoderSession;
@@ -476,8 +691,8 @@ export class GigaamRnntModel {
     this.jointDecoderShape = metaForName(jointSession, this.jointDecoderInputName)?.shape ?? [1, 1, 1];
   }
 
-  initialDecoderStates(batchSize = 1) {
-    const states = new Map();
+  initialDecoderStates(batchSize = 1): Map<string, ort.Tensor> {
+    const states = new Map<string, ort.Tensor>();
     for (const inputName of this.decoderStateInputNames) {
       const meta = metaForName(this.decoderSession, inputName);
       if (!meta || meta.type !== "float32") {
@@ -489,7 +704,7 @@ export class GigaamRnntModel {
     return states;
   }
 
-  adaptJointInput(tensor, targetShape) {
+  adaptJointInput(tensor: ort.Tensor, targetShape: readonly (number | string | undefined)[]): ort.Tensor {
     if (!Array.isArray(targetShape) || targetShape.length !== 3 || tensor.dims.length !== 3) {
       return tensor;
     }
@@ -509,7 +724,7 @@ export class GigaamRnntModel {
           for (let j = 0; j < d2; j += 1) {
             const src = bi * d1 * d2 + i * d2 + j;
             const dst = bi * d2 * d1 + j * d1 + i;
-            out[dst] = tensor.data[src];
+            out[dst] = tensorValueToNumber(tensor.data[src]);
           }
         }
       }
@@ -519,7 +734,7 @@ export class GigaamRnntModel {
     return tensor;
   }
 
-  runJointArgmax(encoderFrameTensor, decoderVectorTensor) {
+  runJointArgmax(encoderFrameTensor: ort.Tensor, decoderVectorTensor: ort.Tensor): Promise<number> {
     const enc = this.adaptJointInput(encoderFrameTensor, this.jointEncoderShape);
     const dec = this.adaptJointInput(decoderVectorTensor, this.jointDecoderShape);
     return this.jointSession.run({
@@ -534,7 +749,7 @@ export class GigaamRnntModel {
     });
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+  async transcribeSamples(samples: AudioSamples, sampleRate = this.sampleRate): Promise<TranscriptResult> {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -557,14 +772,14 @@ export class GigaamRnntModel {
 
     let states = this.initialDecoderStates(1);
     let currentToken = this.blankTokenId;
-    const tokenIds = [];
-    const tokenFrames = [];
+    const tokenIds: number[] = [];
+    const tokenFrames: TokenFrame[] = [];
 
     const limit = Math.min(encoded.encodedLength, time);
     for (let t = 0; t < limit; t += 1) {
       const frameData = new Float32Array(channels);
       for (let c = 0; c < channels; c += 1) {
-        frameData[c] = encoded.encodedData[c * time + t];
+        frameData[c] = tensorValueToNumber(encoded.encodedData[c * time + t]);
       }
       const frameTensor = new ort.Tensor("float32", frameData, [1, channels, 1]);
 
@@ -624,14 +839,29 @@ export class GigaamRnntModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate);
   }
 }
 
-export class ToneCtcModel {
-  constructor({ config, tokens, session }) {
+export class ToneCtcModel implements AsrTranscriber {
+  readonly config?: ModelConfig;
+  readonly tokens: TokenVocabulary;
+  readonly session: ort.InferenceSession;
+  readonly sampleRate: number;
+  readonly blankTokenId: number;
+  readonly signalName: string;
+  readonly stateName: string;
+  readonly logitsName: string;
+  readonly nextStateName: string;
+  readonly signalMeta: TensorMetadata | null;
+  readonly stateMeta: TensorMetadata | null;
+  readonly chunkSamples: number;
+  readonly stateType: string;
+  readonly stateShape: number[];
+
+  constructor({ config, tokens, session }: ToneModelOptions) {
     this.config = config;
     this.tokens = tokens;
     this.session = session;
@@ -640,7 +870,7 @@ export class ToneCtcModel {
       || Number(config?.sample_rate)
       || 8000;
     this.blankTokenId =
-      Number.isInteger(config?.pad_token_id) ? config.pad_token_id : detectBlankTokenId(tokens);
+      typeof config?.pad_token_id === "number" ? config.pad_token_id : detectBlankTokenId(tokens);
 
     this.signalName = session.inputNames[0];
     this.stateName = session.inputNames[1];
@@ -656,7 +886,7 @@ export class ToneCtcModel {
     this.stateShape = shapeFromMeta(this.stateMeta, { batch: 1 });
   }
 
-  toIntPcm(samples) {
+  toIntPcm(samples: Float32Array): Int32Array {
     const out = new Int32Array(samples.length);
     for (let i = 0; i < samples.length; i += 1) {
       const v = Math.max(-1, Math.min(1, samples[i]));
@@ -665,7 +895,12 @@ export class ToneCtcModel {
     return out;
   }
 
-  decodeCtcGreedy(tokens, tokenFrames, sequence, frameStartIndex) {
+  decodeCtcGreedy(
+    tokens: number[],
+    tokenFrames: TokenFrame[],
+    sequence: readonly number[],
+    frameStartIndex: number,
+  ): void {
     let prev = this.blankTokenId;
     for (let i = 0; i < sequence.length; i += 1) {
       const token = sequence[i];
@@ -687,7 +922,7 @@ export class ToneCtcModel {
     }
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+  async transcribeSamples(samples: AudioSamples, sampleRate = this.sampleRate): Promise<TranscriptResult> {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -699,8 +934,8 @@ export class ToneCtcModel {
     const pcm = this.toIntPcm(prepared);
     let state = zerosTensor(this.stateType, this.stateShape);
 
-    const tokenIds = [];
-    const tokenFrames = [];
+    const tokenIds: number[] = [];
+    const tokenFrames: TokenFrame[] = [];
     let frameOffset = 0;
     let consumedSamples = 0;
 
@@ -726,7 +961,7 @@ export class ToneCtcModel {
         throw new Error(`Tone CTC currently expects batch=1, got ${batch}.`);
       }
 
-      const frameTokens = [];
+      const frameTokens: number[] = [];
       for (let t = 0; t < timeSteps; t += 1) {
         const offset = t * vocabSize;
         frameTokens.push(argmaxSlice(logprobs.data, offset, vocabSize));
@@ -748,14 +983,41 @@ export class ToneCtcModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate);
   }
 }
 
-export class SherpaTransducerModel {
-  constructor({ config, tokens, encoderSession, decoderSession, joinerSession }) {
+export class SherpaTransducerModel implements AsrTranscriber {
+  readonly config: ModelConfig;
+  readonly tokens: TokenVocabulary;
+  readonly encoderSession: ort.InferenceSession;
+  readonly decoderSession: ort.InferenceSession;
+  readonly joinerSession: ort.InferenceSession;
+  readonly sampleRate: number;
+  readonly blankTokenId: number;
+  readonly maxSymbolsPerFrame: number;
+  readonly encoderInputName: string;
+  readonly encoderLengthName: string | null;
+  readonly encoderInputMeta: TensorMetadata | null;
+  readonly encoderLengthMeta: TensorMetadata | null;
+  readonly encoderOutputName: string;
+  readonly encoderLengthOutName: string | null;
+  readonly decoderInputName: string;
+  readonly decoderInputMeta: TensorMetadata | null;
+  readonly decoderOutputName: string;
+  readonly contextSize: number;
+  readonly decoderInputType: string;
+  readonly joinerEncName: string;
+  readonly joinerDecName: string;
+  readonly joinerOutputName: string;
+  readonly joinerEncShape: readonly (number | string | undefined)[];
+  readonly joinerDecShape: readonly (number | string | undefined)[];
+  readonly encoderFeatureConfig: ModelConfig;
+  readonly encoderHelper: EncoderModel;
+
+  constructor({ config, tokens, encoderSession, decoderSession, joinerSession }: SherpaModelOptions) {
     this.config = config ?? {};
     this.tokens = tokens;
     this.encoderSession = encoderSession;
@@ -804,7 +1066,7 @@ export class SherpaTransducerModel {
     });
   }
 
-  adaptTensorToShape(tensor, targetShape) {
+  adaptTensorToShape(tensor: ort.Tensor, targetShape: readonly (number | string | undefined)[]): ort.Tensor {
     if (!Array.isArray(targetShape)) {
       return tensor;
     }
@@ -812,7 +1074,7 @@ export class SherpaTransducerModel {
     if (targetShape.length !== tensor.dims.length) {
       // Common sherpa exports use either [B, D] or [B, 1, D]/[B, D, 1].
       if (tensor.dims.length === 3 && targetShape.length === 2 && tensor.dims[0] === 1) {
-        const flat = Float32Array.from(tensor.data);
+        const flat = tensorDataToFloat32(tensor.data);
         if (tensor.dims[1] === 1) {
           return new ort.Tensor("float32", flat, [1, tensor.dims[2]]);
         }
@@ -823,9 +1085,9 @@ export class SherpaTransducerModel {
       if (tensor.dims.length === 2 && targetShape.length === 3 && tensor.dims[0] === 1) {
         const d = tensor.dims[1];
         if (targetShape[1] === 1 || targetShape[2] === d) {
-          return new ort.Tensor("float32", Float32Array.from(tensor.data), [1, 1, d]);
+          return new ort.Tensor("float32", tensorDataToFloat32(tensor.data), [1, 1, d]);
         }
-        return new ort.Tensor("float32", Float32Array.from(tensor.data), [1, d, 1]);
+        return new ort.Tensor("float32", tensorDataToFloat32(tensor.data), [1, d, 1]);
       }
       return tensor;
     }
@@ -840,7 +1102,7 @@ export class SherpaTransducerModel {
       for (let bi = 0; bi < b; bi += 1) {
         for (let i = 0; i < d1; i += 1) {
           for (let j = 0; j < d2; j += 1) {
-            out[bi * d2 * d1 + j * d1 + i] = tensor.data[bi * d1 * d2 + i * d2 + j];
+            out[bi * d2 * d1 + j * d1 + i] = tensorValueToNumber(tensor.data[bi * d1 * d2 + i * d2 + j]);
           }
         }
       }
@@ -850,11 +1112,11 @@ export class SherpaTransducerModel {
     return tensor;
   }
 
-  makeDecoderInput(context) {
+  makeDecoderInput(context: readonly number[]): ort.Tensor {
     return intTensorFor(this.decoderInputType, context, [1, this.contextSize]);
   }
 
-  async runEncoder(samples) {
+  async runEncoder(samples: Float32Array): Promise<TensorMap> {
     const inputRank = this.encoderInputMeta?.shape?.length ?? 2;
     if (inputRank === 2) {
       const signal = new ort.Tensor("float32", samples, [1, samples.length]);
@@ -881,7 +1143,7 @@ export class SherpaTransducerModel {
         const transposed = new Float32Array(time * featureBins);
         for (let f = 0; f < featureBins; f += 1) {
           for (let t = 0; t < time; t += 1) {
-            transposed[t * featureBins + f] = signal.data[f * time + t];
+            transposed[t * featureBins + f] = tensorValueToNumber(signal.data[f * time + t]);
           }
         }
         signal = new ort.Tensor("float32", transposed, [1, time, featureBins]);
@@ -895,7 +1157,7 @@ export class SherpaTransducerModel {
     return outputs;
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate) {
+  async transcribeSamples(samples: AudioSamples, sampleRate = this.sampleRate): Promise<TranscriptResult> {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -911,9 +1173,9 @@ export class SherpaTransducerModel {
       throw new Error("Sherpa encoder output is missing.");
     }
 
-    let channels;
-    let time;
-    let bctData;
+    let channels: number;
+    let time: number;
+    let bctData: TensorData;
     if (enc.dims.length !== 3) {
       throw new Error(`Unexpected Sherpa encoder output shape: [${enc.dims.join(", ")}].`);
     }
@@ -933,26 +1195,26 @@ export class SherpaTransducerModel {
       bctData = new Float32Array(channels * time);
       for (let t = 0; t < time; t += 1) {
         for (let c = 0; c < channels; c += 1) {
-          bctData[c * time + t] = enc.data[t * channels + c];
+          bctData[c * time + t] = tensorValueToNumber(enc.data[t * channels + c]);
         }
       }
     }
 
     const encodedLength = encLen
-      ? Number(Array.from(encLen.data, (v) => (typeof v === "bigint" ? Number(v) : v))[0])
+      ? tensorValueToNumber(Array.from(encLen.data as ArrayLike<string | number | bigint>, tensorValueToNumber)[0] ?? time)
       : time;
     const limit = Math.min(time, encodedLength);
 
-    const tokenIds = [];
-    const tokenFrames = [];
+    const tokenIds: number[] = [];
+    const tokenFrames: TokenFrame[] = [];
     const context = new Array(this.contextSize).fill(this.blankTokenId);
 
     for (let t = 0; t < limit; t += 1) {
       const frame = new Float32Array(channels);
       for (let c = 0; c < channels; c += 1) {
-        frame[c] = bctData[c * time + t];
+        frame[c] = tensorValueToNumber(bctData[c * time + t]);
       }
-      let encTensor = new ort.Tensor("float32", frame, [1, channels, 1]);
+      let encTensor: ort.Tensor = new ort.Tensor("float32", frame, [1, channels, 1]);
       encTensor = this.adaptTensorToShape(encTensor, this.joinerEncShape);
 
       for (let n = 0; n < this.maxSymbolsPerFrame; n += 1) {
@@ -996,12 +1258,13 @@ export class SherpaTransducerModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate);
   }
 }
 
+/** Create an ASR model runtime from resolved model files and config. */
 export async function createAsrModel({
   modelType,
   decoderKind,
@@ -1016,7 +1279,7 @@ export async function createAsrModel({
   addedTokensJson,
   sessionOptions,
   decoderOptions,
-} = {}) {
+}: CreateAsrModelOptions = {}): Promise<AsrTranscriber> {
   if (!modelType || !decoderKind) {
     throw new Error(
       "createAsrModel expects modelType and decoderKind.",
@@ -1033,7 +1296,7 @@ export async function createAsrModel({
     }
     const session = await ort.InferenceSession.create(whisperModel, sessionOptions);
     return new WhisperOrtModel({
-      config,
+      config: config ?? {},
       vocab: JSON.parse(vocabJson),
       addedTokens: addedTokensJson ? JSON.parse(addedTokensJson) : {},
       session,
@@ -1049,7 +1312,7 @@ export async function createAsrModel({
       ort.InferenceSession.create(decoderJointModel, sessionOptions),
     ]);
     return new WhisperHfModel({
-      config,
+      config: config ?? {},
       vocab: JSON.parse(vocabJson),
       addedTokens: addedTokensJson ? JSON.parse(addedTokensJson) : {},
       encoderSession,
@@ -1145,9 +1408,9 @@ export async function createAsrModel({
   }
 
   const sessions = await Promise.all(sessionPromises);
-  const preprocessorSession = preprocessorModel ? sessions[0] : null;
-  const encoderSession = preprocessorModel ? sessions[1] : sessions[0];
-  const decoderSession = preprocessorModel ? sessions[2] : sessions[1];
+  const preprocessorSession = preprocessorModel ? (sessions[0] as ort.InferenceSession) : null;
+  const encoderSession = (preprocessorModel ? sessions[1] : sessions[0]) as ort.InferenceSession;
+  const decoderSession = (preprocessorModel ? sessions[2] : sessions[1]) as ort.InferenceSession;
 
   const tokens = parseVocabulary(vocabularyText);
   const blankTokenId = detectBlankTokenId(tokens);
@@ -1155,7 +1418,7 @@ export async function createAsrModel({
 
   if (decoderKind === "ctc") {
     const blankTokenId =
-      Number.isInteger(config?.pad_token_id) ? config.pad_token_id : detectBlankTokenId(tokens);
+      typeof config?.pad_token_id === "number" ? config.pad_token_id : detectBlankTokenId(tokens);
     return new AsrModel({
       preprocessor: preprocessorSession ? new PreprocessorModel(preprocessorSession) : null,
       encoder: new CtcAcousticModel(encoderSession, {
@@ -1176,7 +1439,7 @@ export async function createAsrModel({
     encoder: new EncoderModel(encoderSession, { config, sampleRate: configuredSampleRate }),
     decoder: new TransducerGreedyDecoder(
       new DecoderTransducerModel(decoderSession, {
-        decoderKind,
+        decoderKind: decoderKind === "rnnt" ? "rnnt" : "tdt",
         vocabSize: tokens.length,
       }),
       {

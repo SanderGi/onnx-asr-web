@@ -3,7 +3,7 @@ import {
   loadHuggingfaceVadModel,
   loadLocalModel,
   loadLocalVadModel,
-} from "../../src/browser.js";
+} from "../../dist/browser.js";
 
 const output = document.getElementById("output");
 const wordsRoot = document.getElementById("words");
@@ -60,8 +60,14 @@ async function playSegment(start, end) {
   const context = await getAudioContext();
   stopCurrentPlayback();
 
-  const clampedStart = Math.max(0, Math.min(start, decodedAudioBuffer.duration));
-  const clampedEnd = Math.max(clampedStart, Math.min(end, decodedAudioBuffer.duration));
+  const clampedStart = Math.max(
+    0,
+    Math.min(start, decodedAudioBuffer.duration),
+  );
+  const clampedEnd = Math.max(
+    clampedStart,
+    Math.min(end, decodedAudioBuffer.duration),
+  );
   const duration = Math.max(0.01, clampedEnd - clampedStart);
 
   const source = context.createBufferSource();
@@ -188,13 +194,17 @@ runButton.addEventListener("click", async () => {
     const lines = [result.text];
     if (isVadEnabled()) {
       if (!Array.isArray(result.segments)) {
-        throw new Error("VAD is enabled, but transcription result has no segments. Model was likely loaded without VAD.");
+        throw new Error(
+          "VAD is enabled, but transcription result has no segments. Model was likely loaded without VAD.",
+        );
       }
       lines.push("");
       lines.push(`VAD: enabled (${vadModeInput.value})`);
       lines.push(`VAD segments: ${result.segments.length}`);
       for (const segment of result.segments) {
-        lines.push(`  [${formatSeconds(segment.startSec)} - ${formatSeconds(segment.endSec)}]`);
+        lines.push(
+          `  [${formatSeconds(segment.startSec)} - ${formatSeconds(segment.endSec)}]`,
+        );
       }
     }
     output.textContent = lines.join("\n");

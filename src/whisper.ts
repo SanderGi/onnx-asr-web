@@ -1,15 +1,56 @@
 import * as ort from "onnxruntime-web";
 import { decodeWav, resampleLinear } from "./audio.js";
+import type { ModelConfig } from "./model-types.js";
+import type { AsrTranscriber, AudioSamples, OrtTensor, TranscriptResult, TensorMap } from "./types.js";
 
-function hzToMel(hz) {
+type TokenMap = Record<string, number>;
+type TokenMatrix = number[][];
+type TensorMetadata = { name: string; type?: string; shape?: readonly (number | string | undefined)[] };
+
+interface WhisperLogMelOptions {
+  sampleRate?: number;
+  nMels?: number;
+}
+
+interface WhisperDecodeOptions {
+  language?: string;
+  maxLength?: number;
+}
+
+interface WhisperBaseOptions {
+  config: ModelConfig;
+  vocab: TokenMap;
+  addedTokens: TokenMap;
+}
+
+interface WhisperOrtOptions extends WhisperBaseOptions {
+  session: ort.InferenceSession;
+}
+
+interface WhisperHfOptions extends WhisperBaseOptions {
+  encoderSession: ort.InferenceSession;
+  decoderSession: ort.InferenceSession;
+}
+
+function tensorValueToNumber(value: string | number | bigint): number {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "string") {
+    return Number(value);
+  }
+  return value;
+}
+
+function hzToMel(hz: number): number {
   return 2595 * Math.log10(1 + hz / 700);
 }
 
-function melToHz(mel) {
+function melToHz(mel: number): number {
   return 700 * (10 ** (mel / 2595) - 1);
 }
 
-function buildHannWindow(length) {
+function buildHannWindow(length: number): Float32Array {
   const window = new Float32Array(length);
   if (length === 1) {
     window[0] = 1;
@@ -21,7 +62,9 @@ function buildHannWindow(length) {
   return window;
 }
 
-function buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax }) {
+function buildMelFilterBank(
+  { sampleRate, nFft, nMels, fMin, fMax }: { sampleRate: number; nFft: number; nMels: number; fMin: number; fMax: number },
+): Float32Array[] {
   const nFreqs = Math.floor(nFft / 2) + 1;
   const bank = Array.from({ length: nMels }, () => new Float32Array(nFreqs));
 
@@ -55,7 +98,7 @@ function buildMelFilterBank({ sampleRate, nFft, nMels, fMin, fMax }) {
   return bank;
 }
 
-function powerSpectrum(frame, nFft) {
+function powerSpectrum(frame: Float32Array, nFft: number): Float32Array {
   const bins = Math.floor(nFft / 2) + 1;
   const out = new Float32Array(bins);
 
@@ -74,7 +117,7 @@ function powerSpectrum(frame, nFft) {
   return out;
 }
 
-function whisperLogMelSpectrogram(samples, options = {}) {
+function whisperLogMelSpectrogram(samples: Float32Array, options: WhisperLogMelOptions = {}): ort.Tensor {
   const sampleRate = options.sampleRate ?? 16000;
   const nMels = options.nMels ?? 80;
   const nFft = 400;
@@ -138,7 +181,7 @@ function whisperLogMelSpectrogram(samples, options = {}) {
   return new ort.Tensor("float32", mel, [1, nMels, frameCount]);
 }
 
-function bytesToUnicode() {
+function bytesToUnicode(): Map<number, string> {
   const bs = [];
   for (let i = 33; i <= 126; i += 1) bs.push(i);
   for (let i = 161; i <= 172; i += 1) bs.push(i);
@@ -160,7 +203,7 @@ function bytesToUnicode() {
   return out;
 }
 
-function argmax(values) {
+function argmax(values: ArrayLike<number>): number {
   let idx = 0;
   let max = -Infinity;
   for (let i = 0; i < values.length; i += 1) {
@@ -172,7 +215,7 @@ function argmax(values) {
   return idx;
 }
 
-function hasAnyState(stateMap) {
+function hasAnyState(stateMap: Map<string, OrtTensor>): boolean {
   for (const value of stateMap.values()) {
     if (value.data.length > 0) {
       return true;
@@ -181,18 +224,22 @@ function hasAnyState(stateMap) {
   return false;
 }
 
-function intTensorFor(type, values, dims) {
+function intTensorFor(type: string, values: readonly number[], dims: readonly number[]): ort.Tensor {
   if (type === "int64") {
     return new ort.Tensor("int64", BigInt64Array.from(values.map((x) => BigInt(x))), dims);
   }
   return new ort.Tensor("int32", Int32Array.from(values), dims);
 }
 
-function boolTensor(values, dims) {
+function boolTensor(values: readonly boolean[], dims: readonly number[]): ort.Tensor {
   return new ort.Tensor("bool", Uint8Array.from(values.map((v) => (v ? 1 : 0))), dims);
 }
 
-function tokenIdsToText(tokenIds, vocabById, byteDecoder) {
+function tokenIdsToText(
+  tokenIds: readonly number[],
+  vocabById: Map<number, string>,
+  byteDecoder: Map<string, number>,
+): string {
   let text = "";
   for (const id of tokenIds) {
     const token = vocabById.get(id);
@@ -212,8 +259,21 @@ function tokenIdsToText(tokenIds, vocabById, byteDecoder) {
   return new TextDecoder("utf-8", { fatal: false }).decode(Uint8Array.from(bytes)).replace(/^ /, "");
 }
 
-class WhisperBaseModel {
-  constructor({ config, vocab, addedTokens }) {
+class WhisperBaseModel implements AsrTranscriber {
+  readonly config: ModelConfig;
+  readonly tokens: TokenMap;
+  readonly vocabById: Map<number, string>;
+  readonly bosTokenId: number;
+  readonly eosTokenId: number;
+  readonly transcribeTokenId: number;
+  readonly notimestampsTokenId: number;
+  readonly transcribeInput: TokenMatrix;
+  readonly detectLangInput: TokenMatrix;
+  readonly byteDecoder: Map<string, number>;
+  readonly sampleRate: number;
+  readonly nMels: number;
+
+  constructor({ config, vocab, addedTokens }: WhisperBaseOptions) {
     this.config = config;
     this.tokens = { ...vocab, ...addedTokens };
     this.vocabById = new Map();
@@ -244,7 +304,7 @@ class WhisperBaseModel {
     this.nMels = Number(config.features_size ?? config.num_mel_bins ?? 80);
   }
 
-  _prepareFeatures(samples, sampleRate) {
+  _prepareFeatures(samples: AudioSamples, sampleRate: number): ort.Tensor {
     let prepared = samples;
     if (!(prepared instanceof Float32Array)) {
       prepared = Float32Array.from(prepared);
@@ -255,11 +315,15 @@ class WhisperBaseModel {
     return whisperLogMelSpectrogram(prepared, { sampleRate: this.sampleRate, nMels: this.nMels });
   }
 
-  _decodeTokens(tokens) {
+  _decodeTokens(tokens: readonly number[]): string {
     return tokenIdsToText(tokens, this.vocabById, this.byteDecoder);
   }
 
-  async _recognizeFeatures(inputFeatures, options = {}) {
+  async _decoding(_inputFeatures: ort.Tensor, _tokens: TokenMatrix, _maxLength = 448): Promise<TokenMatrix> {
+    throw new Error("WhisperBaseModel._decoding() must be implemented by subclasses.");
+  }
+
+  async _recognizeFeatures(inputFeatures: ort.Tensor, options: WhisperDecodeOptions = {}): Promise<TranscriptResult> {
     let prompt = this.transcribeInput.map((row) => row.slice());
     if (options.language) {
       const languageToken = this.tokens[`<|${options.language}|>`];
@@ -283,26 +347,34 @@ class WhisperBaseModel {
     };
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate, options = {}) {
+  async transcribeSamples(
+    samples: AudioSamples,
+    sampleRate = this.sampleRate,
+    options: WhisperDecodeOptions = {},
+  ): Promise<TranscriptResult> {
     const features = this._prepareFeatures(samples, sampleRate);
     return this._recognizeFeatures(features, options);
   }
 
-  async transcribeWavBuffer(arrayBuffer, options = {}) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer, options: WhisperDecodeOptions = {}): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate, options);
   }
 }
 
 export class WhisperOrtModel extends WhisperBaseModel {
-  constructor({ config, vocab, addedTokens, session }) {
+  readonly session: ort.InferenceSession;
+  readonly inputMetadata: Map<string, TensorMetadata>;
+  readonly outputName: string;
+
+  constructor({ config, vocab, addedTokens, session }: WhisperOrtOptions) {
     super({ config, vocab, addedTokens });
     this.session = session;
     this.inputMetadata = new Map(session.inputMetadata.map((meta) => [meta.name, meta]));
     this.outputName = session.outputNames.includes("sequences") ? "sequences" : session.outputNames[0];
   }
 
-  _paramTensor(name, value) {
+  _paramTensor(name: string, value: number): ort.Tensor | null {
     const meta = this.inputMetadata.get(name);
     if (!meta) {
       return null;
@@ -316,11 +388,11 @@ export class WhisperOrtModel extends WhisperBaseModel {
     return intTensorFor("int32", [value], [1]);
   }
 
-  async _decoding(inputFeatures, tokens, maxLength = 448) {
+  async _decoding(inputFeatures: ort.Tensor, tokens: TokenMatrix, maxLength = 448): Promise<TokenMatrix> {
     const decoderInput = Int32Array.from(tokens.flat());
     const decoderTensor = new ort.Tensor("int32", decoderInput, [tokens.length, tokens[0].length]);
 
-    const feeds = {
+    const feeds: Record<string, ort.Tensor> = {
       input_features: inputFeatures,
       decoder_input_ids: decoderTensor,
     };
@@ -347,7 +419,7 @@ export class WhisperOrtModel extends WhisperBaseModel {
       throw new Error("Whisper ORT decoding did not return sequences output.");
     }
 
-    const data = Array.from(sequences.data, (x) => Number(x));
+    const data = Array.from(sequences.data as ArrayLike<string | number | bigint>, tensorValueToNumber);
     const shape = sequences.dims;
     if (shape.length === 3) {
       const [batch, beam, length] = shape;
@@ -372,7 +444,16 @@ export class WhisperOrtModel extends WhisperBaseModel {
 }
 
 export class WhisperHfModel extends WhisperBaseModel {
-  constructor({ config, vocab, addedTokens, encoderSession, decoderSession }) {
+  readonly encoderSession: ort.InferenceSession;
+  readonly decoderSession: ort.InferenceSession;
+  readonly decoderInputMeta: Map<string, TensorMetadata>;
+  readonly decoderOutputNames: readonly string[];
+  readonly inputIdName: string;
+  readonly encoderHiddenName: string;
+  readonly useCacheBranchName: string | null;
+  readonly pastInputNames: string[];
+
+  constructor({ config, vocab, addedTokens, encoderSession, decoderSession }: WhisperHfOptions) {
     super({ config, vocab, addedTokens });
     this.encoderSession = encoderSession;
     this.decoderSession = decoderSession;
@@ -383,9 +464,13 @@ export class WhisperHfModel extends WhisperBaseModel {
     this.inputIdName = decoderSession.inputNames.includes("input_ids")
       ? "input_ids"
       : decoderSession.inputNames[0];
-    this.encoderHiddenName = decoderSession.inputNames.includes("encoder_hidden_states")
+    const encoderHiddenName = decoderSession.inputNames.includes("encoder_hidden_states")
       ? "encoder_hidden_states"
       : decoderSession.inputNames.find((name) => name.includes("encoder"));
+    if (!encoderHiddenName) {
+      throw new Error("Whisper decoder is missing encoder hidden state input.");
+    }
+    this.encoderHiddenName = encoderHiddenName;
     this.useCacheBranchName = decoderSession.inputNames.includes("use_cache_branch")
       ? "use_cache_branch"
       : null;
@@ -393,7 +478,7 @@ export class WhisperHfModel extends WhisperBaseModel {
     this.pastInputNames = decoderSession.inputNames.filter((name) => name.startsWith("past_key_values."));
   }
 
-  _emptyStateTensor(meta) {
+  _emptyStateTensor(meta: TensorMetadata): ort.Tensor {
     const shape = (meta.shape ?? []).map((dim) => {
       if (typeof dim === "number") {
         return dim >= 0 ? dim : 1;
@@ -410,8 +495,8 @@ export class WhisperHfModel extends WhisperBaseModel {
     return new ort.Tensor("float32", new Float32Array(size), shape);
   }
 
-  _createState() {
-    const state = new Map();
+  _createState(): Map<string, ort.Tensor> {
+    const state = new Map<string, ort.Tensor>();
     for (const name of this.pastInputNames) {
       const meta = this.decoderInputMeta.get(name);
       if (!meta) {
@@ -422,7 +507,7 @@ export class WhisperHfModel extends WhisperBaseModel {
     return state;
   }
 
-  _decoderInputTensor(tokens, useCache) {
+  _decoderInputTensor(tokens: TokenMatrix, useCache: boolean): ort.Tensor {
     const width = useCache ? 1 : tokens[0].length;
     const data = new Int32Array(tokens.length * width);
     for (let b = 0; b < tokens.length; b += 1) {
@@ -440,15 +525,15 @@ export class WhisperHfModel extends WhisperBaseModel {
     return new ort.Tensor("int32", data, [tokens.length, width]);
   }
 
-  async _encode(inputFeatures) {
+  async _encode(inputFeatures: ort.Tensor): Promise<OrtTensor> {
     const inputName = this.encoderSession.inputNames[0];
     const outputs = await this.encoderSession.run({ [inputName]: inputFeatures });
     return outputs[this.encoderSession.outputNames[0]];
   }
 
-  async _decodeStep(tokens, state, encoderOut) {
+  async _decodeStep(tokens: TokenMatrix, state: Map<string, ort.Tensor>, encoderOut: OrtTensor) {
     const useCache = hasAnyState(state);
-    const feeds = {
+    const feeds: Record<string, ort.Tensor> = {
       [this.inputIdName]: this._decoderInputTensor(tokens, useCache),
       [this.encoderHiddenName]: encoderOut,
     };
@@ -464,18 +549,22 @@ export class WhisperHfModel extends WhisperBaseModel {
     const outputs = await this.decoderSession.run(feeds);
     const logits = outputs[this.decoderOutputNames[0]];
 
-    const nextState = new Map();
+    const nextState = new Map<string, ort.Tensor>();
     for (const inputName of this.pastInputNames) {
       const outputName = inputName.replace("past_key_values.", "present.");
       const prev = state.get(inputName);
       const candidate = outputs[outputName] ?? prev;
-      nextState.set(inputName, candidate && candidate.data.length > 0 ? candidate : prev);
+      if (candidate && candidate.data.length > 0) {
+        nextState.set(inputName, candidate);
+      } else if (prev) {
+        nextState.set(inputName, prev);
+      }
     }
 
     return { logits, nextState };
   }
 
-  async _decoding(inputFeatures, tokens, maxLength = 448) {
+  async _decoding(inputFeatures: ort.Tensor, tokens: TokenMatrix, maxLength = 448): Promise<TokenMatrix> {
     const encoderOut = await this._encode(inputFeatures);
     let state = this._createState();
     let outputTokens = tokens.map((row) => row.slice());
@@ -496,7 +585,11 @@ export class WhisperHfModel extends WhisperBaseModel {
         }
 
         const offset = b * seqLen * vocabSize + (seqLen - 1) * vocabSize;
-        const next = argmax(logits.data.slice(offset, offset + vocabSize));
+        const next = argmax(
+          Array.from({ length: vocabSize }, (_, index) =>
+            tensorValueToNumber((logits.data as ArrayLike<string | number | bigint>)[offset + index] ?? 0),
+          ),
+        );
         outputTokens[b].push(next);
       }
 

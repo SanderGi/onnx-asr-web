@@ -3,11 +3,18 @@ const WAVE = 0x57415645;
 const FMT = 0x666d7420;
 const DATA = 0x64617461;
 
-function readChunkId(view, offset) {
+interface WaveFormat {
+  audioFormat: number;
+  channels: number;
+  sampleRate: number;
+  bitsPerSample: number;
+}
+
+function readChunkId(view: DataView, offset: number): number {
   return view.getUint32(offset, false);
 }
 
-function parseFmtChunk(view, offset) {
+function parseFmtChunk(view: DataView, offset: number): WaveFormat {
   const audioFormat = view.getUint16(offset + 8, true);
   const channels = view.getUint16(offset + 10, true);
   const sampleRate = view.getUint32(offset + 12, true);
@@ -16,7 +23,7 @@ function parseFmtChunk(view, offset) {
   return { audioFormat, channels, sampleRate, bitsPerSample };
 }
 
-function decodePcm(view, offset, byteLength, fmt) {
+function decodePcm(view: DataView, offset: number, byteLength: number, fmt: WaveFormat): Float32Array {
   const { audioFormat, channels, bitsPerSample } = fmt;
   const bytesPerSample = bitsPerSample / 8;
   const totalSamples = byteLength / bytesPerSample;
@@ -48,7 +55,7 @@ function decodePcm(view, offset, byteLength, fmt) {
   return mono;
 }
 
-export function decodeWav(arrayBuffer) {
+export function decodeWav(arrayBuffer: ArrayBuffer): { sampleRate: number; samples: Float32Array } {
   const view = new DataView(arrayBuffer);
   if (readChunkId(view, 0) !== RIFF || readChunkId(view, 8) !== WAVE) {
     throw new Error("Invalid WAV file header.");
@@ -88,7 +95,7 @@ export function decodeWav(arrayBuffer) {
   };
 }
 
-export function resampleLinear(samples, inputRate, outputRate) {
+export function resampleLinear(samples: Float32Array, inputRate: number, outputRate: number): Float32Array {
   if (inputRate === outputRate) {
     return samples;
   }
@@ -108,7 +115,7 @@ export function resampleLinear(samples, inputRate, outputRate) {
   return out;
 }
 
-export function normalize(samples) {
+export function normalize(samples: Float32Array): Float32Array {
   let sum = 0;
   for (let i = 0; i < samples.length; i += 1) {
     sum += samples[i];

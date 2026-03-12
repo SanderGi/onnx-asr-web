@@ -21,6 +21,7 @@ JavaScript ONNX ASR for Node.js and browser using [`onnxruntime-web`](https://gi
 - Uses Voice Activity Detection (VAD) to do long-form speech-to-text
 - Extracts word-level timestamps
 - Minimal dependencies (just `onnxruntime-web`)
+- Full types
 
 ## Supported Model Types
 
@@ -39,7 +40,11 @@ npm install onnx-asr-web
 
 `onnxruntime-web` must be `1.24.x` or newer. Earlier versions can fail on some models (notably browser VAD graphs).
 
-## Node.js API
+## API Reference
+
+Generated API docs are published in [`API.md`](./API.md). They are emitted from the TypeScript declaration output during `npm run build`, so they stay aligned with the shipped package surface.
+
+### Node.js
 
 ```js
 import {
@@ -69,7 +74,7 @@ const hf = await loadHuggingfaceModel("istupakov/parakeet-tdt-0.6b-v3-onnx", {
 
 `loadHuggingfaceModel()` downloads into `${cacheDir}/${repo_id}` and reuses cached files.
 
-## Browser API
+### Browser
 
 ```js
 import {
@@ -86,7 +91,7 @@ const modelA = await loadLocalModel("/models/parakeet-tdt-0.6b-v3-onnx/", { vadM
 const modelB = await loadHuggingfaceModel("istupakov/parakeet-tdt-0.6b-v3-onnx");
 ```
 
-## Transcription
+### Transcription
 
 ```js
 const result = await model.transcribeWavBuffer(await file.arrayBuffer());
@@ -94,7 +99,31 @@ console.log(result.text);
 console.log(result.words); // [{word, start, end}] in seconds
 ```
 
-## Model Files
+Use `transcribeWavBuffer()` when you have a real WAV file as bytes, for example from:
+
+- a browser file input
+- `fs.readFile()` in Node.js
+- a downloaded `.wav` asset
+
+Use `transcribeSamples()` when you already have decoded mono PCM samples and know the sample rate:
+
+```js
+const result = await model.transcribeSamples(float32Samples, sampleRate);
+console.log(result.text);
+```
+
+This is usually the right choice when audio is coming from:
+
+- Web Audio API decoding such as `AudioBuffer.getChannelData(...)`
+- microphone capture pipelines that already produce PCM chunks
+- custom preprocessing or resampling code
+- non-WAV formats that you decode yourself before transcription
+
+`transcribeSamples()` expects normalized mono PCM, typically a `Float32Array` with values in `[-1, 1]`, plus the input sample rate. The library will resample internally when needed.
+
+`transcribeWavBuffer()` is just a convenience wrapper: it decodes the WAV container first and then forwards the decoded samples into `transcribeSamples()`.
+
+### Model Files
 
 `loadLocalModel()` expects `config.json` plus model files referenced by model type:
 
@@ -123,6 +152,7 @@ Word timestamps are currently provided for NeMo transducer models. Whisper retur
 
 ### Node.js CLI
 ```bash
+npm run build
 node examples/node/transcribe.mjs --repo-id istupakov/parakeet-tdt-0.6b-v3-onnx --cache-dir models --audio test.wav
 ```
 
@@ -134,6 +164,20 @@ npx http-server . # then /examples/browser/index.html
 ### Browser UI (CDN package import)
 ```bash
 npx http-server . # then /examples/browser-cdn/index.html
+```
+
+## Testing
+
+Run type/syntax checks:
+
+```bash
+npm run check
+```
+
+Run integration model tests (requires local model folders under `models/`):
+
+```bash
+npm test
 ```
 
 ## Build and Publish

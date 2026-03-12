@@ -1,7 +1,23 @@
 import * as ort from "onnxruntime-web";
 import { decodeWav, resampleLinear } from "./audio.js";
+import type {
+  AsrTranscriber,
+  AudioSamples,
+  OrtTensor,
+  TensorMap,
+  TranscriptResult,
+  VadDetector,
+  VadRuntimeOptions,
+  VadSpeechProbabilities,
+  SegmentTimestamp,
+  WordTimestamp,
+} from "./types.js";
 
-function firstExistingName(names, candidates, fallbackIndex = 0) {
+function firstExistingName(
+  names: readonly string[],
+  candidates: readonly string[],
+  fallbackIndex = 0,
+): string {
   for (const candidate of candidates) {
     if (names.includes(candidate)) {
       return candidate;
@@ -10,11 +26,11 @@ function firstExistingName(names, candidates, fallbackIndex = 0) {
   return names[fallbackIndex];
 }
 
-function int64Scalar(value) {
+function int64Scalar(value: number): ort.Tensor {
   return new ort.Tensor("int64", new BigInt64Array([BigInt(value)]), []);
 }
 
-function joinText(parts) {
+function joinText(parts: readonly string[]): string {
   return parts
     .filter((text) => typeof text === "string" && text.trim().length > 0)
     .join(" ")
@@ -22,7 +38,7 @@ function joinText(parts) {
     .trim();
 }
 
-function toFloat32(samples) {
+function toFloat32(samples: AudioSamples): Float32Array {
   if (samples instanceof Float32Array) {
     return samples;
   }
@@ -30,7 +46,21 @@ function toFloat32(samples) {
 }
 
 export class SileroVadModel {
-  constructor(session, options = {}) {
+  readonly session: ort.InferenceSession;
+  readonly sampleRate: number;
+  readonly threshold: number;
+  readonly negThreshold: number;
+  readonly minSpeechMs: number;
+  readonly minSilenceMs: number;
+  readonly speechPadMs: number;
+  readonly windowSamples: number;
+  readonly inputName: string;
+  readonly stateInputName: string;
+  readonly srInputName: string;
+  readonly outputName: string;
+  readonly stateOutputName: string;
+
+  constructor(session: ort.InferenceSession, options: VadRuntimeOptions = {}) {
     this.session = session;
     this.sampleRate = Number(options.sampleRate) || 16000;
     this.threshold = options.threshold ?? 0.5;
@@ -48,18 +78,21 @@ export class SileroVadModel {
     this.stateOutputName = firstExistingName(session.outputNames, ["stateN", "state", "new_state"], 1);
   }
 
-  initialState() {
+  initialState(): ort.Tensor {
     return new ort.Tensor("float32", new Float32Array(2 * 128), [2, 1, 128]);
   }
 
-  async speechProbabilities(samples, sampleRate = this.sampleRate) {
+  async speechProbabilities(
+    samples: AudioSamples,
+    sampleRate = this.sampleRate,
+  ): Promise<VadSpeechProbabilities> {
     let prepared = toFloat32(samples);
     if (sampleRate !== this.sampleRate) {
       prepared = resampleLinear(prepared, sampleRate, this.sampleRate);
     }
 
-    const probs = [];
-    let state = this.initialState();
+    const probs: number[] = [];
+    let state: OrtTensor = this.initialState();
     let offset = 0;
     while (offset < prepared.length) {
       const end = Math.min(offset + this.windowSamples, prepared.length);
@@ -70,10 +103,10 @@ export class SileroVadModel {
         [this.inputName]: new ort.Tensor("float32", chunk, [1, this.windowSamples]),
         [this.stateInputName]: state,
         [this.srInputName]: int64Scalar(this.sampleRate),
-      });
+      }) as TensorMap;
 
       const prob = outputs[this.outputName];
-      const nextState = outputs[this.stateOutputName];
+      const nextState = outputs[this.stateOutputName] as ort.Tensor | undefined;
       if (!prob || !nextState) {
         throw new Error("Silero VAD outputs are missing probability or next state.");
       }
@@ -90,7 +123,11 @@ export class SileroVadModel {
    * Returns speech segments in input sample-rate coordinates.
    * Segment bounds are [start, end), in samples.
    */
-  async detectSpeechSegments(samples, sampleRate = this.sampleRate, overrides = {}) {
+  async detectSpeechSegments(
+    samples: Float32Array | number[],
+    sampleRate = this.sampleRate,
+    overrides: VadRuntimeOptions = {},
+  ): Promise<SegmentTimestamp[]> {
     const threshold = overrides.threshold ?? this.threshold;
     const negThreshold = overrides.negThreshold ?? this.negThreshold;
     const minSpeechSamples = Math.round(((overrides.minSpeechMs ?? this.minSpeechMs) / 1000) * this.sampleRate);
@@ -104,7 +141,7 @@ export class SileroVadModel {
       ? prepared.length
       : Math.round(processedSamples * ratioToVad);
 
-    const raw = [];
+    const raw: Array<{ start: number; end: number }> = [];
     let activeStart = -1;
     let pendingEnd = -1;
 
@@ -152,7 +189,7 @@ export class SileroVadModel {
       end: segment.end + speechPadSamples,
     }));
 
-    const merged = [];
+    const merged: Array<{ start: number; end: number }> = [];
     for (const segment of padded) {
       const last = merged[merged.length - 1];
       if (!last || segment.start > last.end + minSilenceSamples) {
@@ -178,16 +215,25 @@ export class SileroVadModel {
 }
 
 export class VadChunkedAsrModel {
-  constructor(baseModel, vadModel, options = {}) {
+  readonly baseModel: AsrTranscriber;
+  readonly vadModel: VadDetector;
+  readonly options: VadRuntimeOptions;
+  readonly sampleRate: number;
+
+  constructor(baseModel: AsrTranscriber, vadModel: VadDetector, options: VadRuntimeOptions = {}) {
     this.baseModel = baseModel;
     this.vadModel = vadModel;
     this.options = options;
     this.sampleRate = baseModel.sampleRate ?? vadModel.sampleRate ?? 16000;
   }
 
-  async transcribeSamples(samples, sampleRate = this.sampleRate, options = {}) {
+  async transcribeSamples(
+    samples: AudioSamples,
+    sampleRate = this.sampleRate,
+    options: Record<string, unknown> = {},
+  ): Promise<TranscriptResult> {
     const prepared = toFloat32(samples);
-    const vadOptions = options.vadOptions ?? this.options;
+    const vadOptions = (options as { vadOptions?: VadRuntimeOptions }).vadOptions ?? this.options;
     const segments = await this.vadModel.detectSpeechSegments(prepared, sampleRate, vadOptions);
 
     if (segments.length === 0) {
@@ -200,9 +246,9 @@ export class VadChunkedAsrModel {
       };
     }
 
-    const tokenIds = [];
-    const words = [];
-    const texts = [];
+    const tokenIds: number[] = [];
+    const words: WordTimestamp[] = [];
+    const texts: string[] = [];
     for (const segment of segments) {
       const chunk = prepared.subarray(segment.start, segment.end);
       const chunkResult = await this.baseModel.transcribeSamples(chunk, sampleRate, options);
@@ -228,23 +274,33 @@ export class VadChunkedAsrModel {
     };
   }
 
-  async transcribeWavBuffer(arrayBuffer, options = {}) {
+  async transcribeWavBuffer(arrayBuffer: ArrayBuffer, options: Record<string, unknown> = {}): Promise<TranscriptResult> {
     const decoded = decodeWav(arrayBuffer);
     return this.transcribeSamples(decoded.samples, decoded.sampleRate, options);
   }
 }
 
-export function withVadModel(asrModel, vadModel, options = {}) {
+/** Wrap an ASR model with VAD-based speech chunking. */
+export function withVadModel(
+  asrModel: AsrTranscriber,
+  vadModel: VadDetector,
+  options: VadRuntimeOptions = {},
+): VadChunkedAsrModel {
   if (!vadModel || typeof vadModel.detectSpeechSegments !== "function") {
     throw new Error("Invalid VAD model: expected detectSpeechSegments(samples, sampleRate, options).");
   }
   return new VadChunkedAsrModel(asrModel, vadModel, options);
 }
 
+/** Create a Silero VAD model from a local path or URL. */
 export async function createSileroVadModel({
   modelPath,
   sessionOptions,
   options = {},
+}: {
+  modelPath?: string;
+  sessionOptions?: ort.InferenceSession.SessionOptions;
+  options?: VadRuntimeOptions;
 } = {}) {
   if (!modelPath) {
     throw new Error("createSileroVadModel expects modelPath.");

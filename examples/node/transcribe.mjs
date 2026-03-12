@@ -5,7 +5,7 @@ import {
   loadHuggingfaceVadModel,
   loadLocalModel,
   loadLocalVadModel,
-} from "../../src/node.js";
+} from "../../dist/node.js";
 
 function parseArgs(argv) {
   const args = {};
@@ -34,7 +34,7 @@ function parseArgs(argv) {
 
 function printUsage() {
   console.log(
-    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none] [--vad-model-dir <path> | --vad-repo-id <org/repo>]"
+    "Usage: node examples/node/transcribe.mjs (--model-dir <path> | --repo-id <org/repo> [--cache-dir <path>]) --audio <wav> [--quantization int8|none] [--vad-model-dir <path> | --vad-repo-id <org/repo>]",
   );
   console.log("");
   console.log("Expected model files in model dir/cache:");
@@ -45,7 +45,7 @@ function printUsage() {
   console.log("  optional: nemo128.onnx (required for nemo-conformer-tdt)");
   console.log("");
   console.log(
-    "By default, --quantization is int8 (prefers *.int8.onnx when available)."
+    "By default, --quantization is int8 (prefers *.int8.onnx when available).",
   );
   console.log("Optional VAD: onnx-community/silero-vad (onnx/model*.onnx).");
 }
@@ -64,11 +64,11 @@ async function main() {
         sessionOptions: { executionProviders: ["wasm"] },
       })
     : args.vadModelDir
-    ? await loadLocalVadModel(args.vadModelDir, {
-        quantization: args.quantization,
-        sessionOptions: { executionProviders: ["wasm"] },
-      })
-    : null;
+      ? await loadLocalVadModel(args.vadModelDir, {
+          quantization: args.quantization,
+          sessionOptions: { executionProviders: ["wasm"] },
+        })
+      : null;
 
   const model = args.repoId
     ? await loadHuggingfaceModel(args.repoId, {
@@ -87,8 +87,8 @@ async function main() {
   const { text, tokenIds, words, segments } = await model.transcribeWavBuffer(
     wavBuffer.buffer.slice(
       wavBuffer.byteOffset,
-      wavBuffer.byteOffset + wavBuffer.byteLength
-    )
+      wavBuffer.byteOffset + wavBuffer.byteLength,
+    ),
   );
 
   console.log(`Audio: ${basename(args.audio)}`);
@@ -101,7 +101,7 @@ async function main() {
     console.log("Words:");
     for (const word of words) {
       console.log(
-        `  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`
+        `  [${word.start.toFixed(3)} - ${word.end.toFixed(3)}] ${word.word}`,
       );
     }
   }

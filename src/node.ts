@@ -2,11 +2,50 @@ import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configureOrtWeb, createAsrModel } from "./asr-model.js";
 import { detectModelType, parseConfigText, toneVocabularyTextFromConfig } from "./model-types.js";
-import { createSileroVadModel, withVadModel } from "./vad.js";
+import type {
+  AsrTranscriber,
+  CommonModelLoadOptions,
+  DecoderOptions,
+  SessionOptions,
+  VadDetector,
+  VadRuntimeOptions,
+} from "./types.js";
+import {
+  createSileroVadModel,
+  withVadModel,
+} from "./vad.js";
+
+type HeadersMap = Record<string, string>;
+type VadOptions = VadRuntimeOptions;
+
+export interface NodeModelLoadOptions extends CommonModelLoadOptions {
+  sessionOptions?: SessionOptions;
+  decoderOptions?: DecoderOptions;
+  vadModel?: VadDetector | null;
+  vad?: VadDetector | null;
+  vadOptions?: VadOptions;
+}
+
+/** Additional Node-only options for downloading from Hugging Face. */
+export interface NodeHuggingFaceOptions extends NodeModelLoadOptions {
+  fetch?: typeof fetch;
+  cacheDir?: string;
+  revision?: string;
+  endpoint?: string;
+  hfToken?: string;
+  forceDownload?: boolean;
+}
 
 export { configureOrtWeb };
 
-function normalizeRepoId(repoId) {
+function requireString(value: string | null | undefined, message: string): string {
+  if (!value) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function normalizeRepoId(repoId: string): string[] {
   const parts = repoId
     .split("/")
     .map((part) => part.trim())
@@ -22,16 +61,16 @@ function normalizeRepoId(repoId) {
   return parts;
 }
 
-function resolveHfBaseUrl(repoId, revision = "main", endpoint = "https://huggingface.co") {
+function resolveHfBaseUrl(repoId: string, revision = "main", endpoint = "https://huggingface.co"): string {
   const safeRevision = encodeURIComponent(revision);
   return `${endpoint.replace(/\/$/, "")}/${repoId}/resolve/${safeRevision}`;
 }
 
-function resolveHfApiBase(endpoint = "https://huggingface.co") {
+function resolveHfApiBase(endpoint = "https://huggingface.co"): string {
   return endpoint.replace(/\/$/, "");
 }
 
-function modelFilenameCandidates(filename, quantization = "int8") {
+function modelFilenameCandidates(filename: string, quantization = "int8"): string[] {
   if (!filename.endsWith(".onnx")) {
     return [filename];
   }
@@ -46,7 +85,7 @@ function modelFilenameCandidates(filename, quantization = "int8") {
   return [...unique];
 }
 
-function sidecarCandidates(onnxPath) {
+function sidecarCandidates(onnxPath: string): string[] {
   if (!onnxPath.endsWith(".onnx")) {
     return [];
   }
@@ -56,7 +95,7 @@ function sidecarCandidates(onnxPath) {
   ];
 }
 
-async function fileExists(path) {
+async function fileExists(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;
@@ -65,7 +104,10 @@ async function fileExists(path) {
   }
 }
 
-async function fetchRequired(url, { fetchImpl, headers }) {
+async function fetchRequired(
+  url: string,
+  { fetchImpl, headers }: { fetchImpl: typeof fetch; headers?: HeadersMap },
+): Promise<Response> {
   const response = await fetchImpl(url, { headers });
   if (!response.ok) {
     throw new Error(`Failed to download ${url}: ${response.status} ${response.statusText}`);
@@ -73,7 +115,10 @@ async function fetchRequired(url, { fetchImpl, headers }) {
   return response;
 }
 
-async function fetchOptional(url, { fetchImpl, headers }) {
+async function fetchOptional(
+  url: string,
+  { fetchImpl, headers }: { fetchImpl: typeof fetch; headers?: HeadersMap },
+): Promise<Response | null> {
   const response = await fetchImpl(url, { headers });
   if (response.status === 404) {
     return null;
@@ -84,13 +129,13 @@ async function fetchOptional(url, { fetchImpl, headers }) {
   return response;
 }
 
-async function writeResponseToFile(response, filePath) {
+async function writeResponseToFile(response: Response, filePath: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
   const bytes = new Uint8Array(await response.arrayBuffer());
   await writeFile(filePath, bytes);
 }
 
-async function selectExistingFile(dir, candidates) {
+async function selectExistingFile(dir: string, candidates: readonly string[]): Promise<string | null> {
   for (const candidate of candidates) {
     if (await fileExists(join(dir, candidate))) {
       return candidate;
@@ -99,13 +144,16 @@ async function selectExistingFile(dir, candidates) {
   return null;
 }
 
-async function selectOrFallbackModelFile(dir, filename, quantization) {
+async function selectOrFallbackModelFile(dir: string, filename: string, quantization: string): Promise<string> {
   const candidates = modelFilenameCandidates(filename, quantization);
   const existing = await selectExistingFile(dir, candidates);
   return existing ?? candidates[candidates.length - 1];
 }
 
-async function selectOrReadVocabulary(dir, candidates) {
+async function selectOrReadVocabulary(
+  dir: string,
+  candidates: readonly string[],
+): Promise<{ filename: string; text: string }> {
   const existing = await selectExistingFile(dir, candidates);
   if (!existing) {
     throw new Error(`Missing vocabulary file. Checked: ${candidates.join(", ")}`);
@@ -115,18 +163,18 @@ async function selectOrReadVocabulary(dir, candidates) {
   return { filename: existing, text };
 }
 
-function vocabJsonToText(vocabJsonText) {
+function vocabJsonToText(vocabJsonText: string): string {
   const parsed = JSON.parse(vocabJsonText);
   const entries = Object.entries(parsed)
     .filter(([, id]) => Number.isInteger(id))
-    .sort((a, b) => a[1] - b[1]);
+    .sort((a, b) => Number(a[1]) - Number(b[1]));
   if (entries.length === 0) {
     throw new Error("Invalid vocab.json mapping.");
   }
   return `${entries.map(([token, id]) => `${token} ${id}`).join("\n")}\n`;
 }
 
-async function walkFiles(root, prefix = "") {
+async function walkFiles(root: string, prefix = ""): Promise<string[]> {
   const entries = await readdir(join(root, prefix), { withFileTypes: true });
   const out = [];
 
@@ -142,7 +190,7 @@ async function walkFiles(root, prefix = "") {
   return out;
 }
 
-function pickQuantizedByPattern(files, pattern, quantization = "int8") {
+function pickQuantizedByPattern(files: readonly string[], pattern: RegExp, quantization = "int8"): string | null {
   const matches = files.filter((file) => pattern.test(file));
   if (matches.length === 0) {
     return null;
@@ -157,18 +205,29 @@ function pickQuantizedByPattern(files, pattern, quantization = "int8") {
   return plain ?? matches[0];
 }
 
-async function listHuggingFaceRepoFiles(repoId, revision, endpoint, requestOptions) {
+async function listHuggingFaceRepoFiles(
+  repoId: string,
+  revision: string,
+  endpoint: string | undefined,
+  requestOptions: { fetchImpl: typeof fetch; headers?: HeadersMap },
+): Promise<Set<string>> {
   const apiBase = resolveHfApiBase(endpoint);
   const url = `${apiBase}/api/models/${repoId}/tree/${encodeURIComponent(revision)}?recursive=1`;
   const response = await fetchRequired(url, requestOptions);
-  const payload = await response.json();
+  const payload = await response.json() as Array<{ path?: string }>;
   const files = payload
-    .map((item) => item.path)
-    .filter((path) => typeof path === "string");
+    .map((item: { path?: string }) => item.path)
+    .filter((path: string | undefined): path is string => typeof path === "string");
   return new Set(files);
 }
 
-async function downloadPath(baseUrl, modelDir, relativePath, requestOptions, { required = true } = {}) {
+async function downloadPath(
+  baseUrl: string,
+  modelDir: string,
+  relativePath: string,
+  requestOptions: { fetchImpl: typeof fetch; headers?: HeadersMap },
+  { required = true }: { required?: boolean } = {},
+): Promise<boolean> {
   const url = `${baseUrl}/${relativePath}`;
   const localPath = join(modelDir, relativePath);
   const response = required
@@ -183,7 +242,13 @@ async function downloadPath(baseUrl, modelDir, relativePath, requestOptions, { r
   return true;
 }
 
-async function ensureSidecars(baseUrl, modelDir, modelPath, requestOptions, repoFiles = null) {
+async function ensureSidecars(
+  baseUrl: string,
+  modelDir: string,
+  modelPath: string,
+  requestOptions: { fetchImpl: typeof fetch; headers?: HeadersMap },
+  repoFiles: ReadonlySet<string> | null = null,
+): Promise<void> {
   for (const sidecar of sidecarCandidates(modelPath)) {
     const local = join(modelDir, sidecar);
     if (await fileExists(local)) {
@@ -198,7 +263,10 @@ async function ensureSidecars(baseUrl, modelDir, modelPath, requestOptions, repo
   }
 }
 
-async function resolveWhisperLocalArtifacts(modelDir, quantization) {
+async function resolveWhisperLocalArtifacts(
+  modelDir: string,
+  quantization: string,
+): Promise<{ beamsearch: string; vocabPath: string; addedTokensPath: string | null }> {
   const files = await walkFiles(modelDir);
   const beamsearch = pickQuantizedByPattern(files, /_beamsearch(?:\.int8)?\.onnx$/, quantization);
   if (!beamsearch) {
@@ -214,7 +282,10 @@ async function resolveWhisperLocalArtifacts(modelDir, quantization) {
   return { beamsearch, vocabPath, addedTokensPath };
 }
 
-function pickGigaamVersion(config, files) {
+function pickGigaamVersion(
+  config: { version?: unknown; [key: string]: unknown },
+  files: readonly string[],
+): string {
   if (config.version) {
     return String(config.version);
   }
@@ -227,7 +298,14 @@ function pickGigaamVersion(config, files) {
   return "v2";
 }
 
-function selectGigaamArtifacts(config, files, quantization) {
+function selectGigaamArtifacts(
+  config: { version?: unknown; [key: string]: unknown },
+  files: readonly string[],
+  quantization: string,
+): (
+  | { mode: "rnnt"; version: string; encoder: string; decoder: string; joint: string; vocab: string }
+  | { mode: "ctc"; version: string; ctcModel: string; vocab: string }
+) {
   const version = pickGigaamVersion(config, files);
   const preferPrefixes = [`${version}_rnnt`, `${version}_e2e_rnnt`];
 
@@ -264,7 +342,13 @@ function selectGigaamArtifacts(config, files, quantization) {
   throw new Error("Could not resolve GigaAM artifacts (RNNT or CTC) from local files.");
 }
 
-function selectNemoConformerArtifacts(files, quantization) {
+function selectNemoConformerArtifacts(
+  files: readonly string[],
+  quantization: string,
+): (
+  | { mode: "rnnt"; encoder: string; decoderJoint: string }
+  | { mode: "ctc"; ctcModel: string }
+) {
   const encoder = pickQuantizedByPattern(files, /^encoder-model(?:\.int8)?\.onnx$/, quantization);
   const decoderJoint = pickQuantizedByPattern(files, /^decoder_joint-model(?:\.int8)?\.onnx$/, quantization);
   if (encoder && decoderJoint) {
@@ -279,7 +363,7 @@ function selectNemoConformerArtifacts(files, quantization) {
   throw new Error("Could not resolve nemo-conformer artifacts (RNNT or CTC).");
 }
 
-function selectSherpaArtifacts(files, quantization) {
+function selectSherpaArtifacts(files: readonly string[], quantization: string) {
   const amDir = files.some((name) => name.startsWith("am-onnx/")) ? "am-onnx" : "am";
   const encoder = pickQuantizedByPattern(files, new RegExp(`^${amDir}/encoder(?:\\.int8)?\\.onnx$`), quantization);
   const decoder = pickQuantizedByPattern(files, new RegExp(`^${amDir}/decoder(?:\\.int8)?\\.onnx$`), quantization);
@@ -296,14 +380,14 @@ function selectSherpaArtifacts(files, quantization) {
   return { encoder, decoder, joiner, tokens };
 }
 
-function vadModelCandidates(quantization = "int8") {
+function vadModelCandidates(quantization = "int8"): string[] {
   if (quantization && quantization !== "none" && quantization !== "float32" && quantization !== "fp32") {
     return [`onnx/model_${quantization}.onnx`, "onnx/model.onnx", "model.onnx"];
   }
   return ["onnx/model.onnx", "onnx/model_int8.onnx", "model.onnx"];
 }
 
-function selectSileroVadArtifact(files, quantization) {
+function selectSileroVadArtifact(files: readonly string[], quantization: string): string {
   for (const candidate of vadModelCandidates(quantization)) {
     if (files.includes(candidate)) {
       return candidate;
@@ -317,11 +401,14 @@ function selectSileroVadArtifact(files, quantization) {
   throw new Error("Could not resolve Silero VAD model file (expected onnx/model*.onnx).");
 }
 
-function resolveVadOption(options = {}) {
+function resolveVadOption(options: NodeModelLoadOptions = {}): VadDetector | null {
   return options.vadModel ?? options.vad ?? null;
 }
 
-function attachVadIfProvided(asrModel, options = {}) {
+function attachVadIfProvided(
+  asrModel: AsrTranscriber,
+  options: NodeModelLoadOptions = {},
+): AsrTranscriber {
   const vadModel = resolveVadOption(options);
   if (!vadModel) {
     return asrModel;
@@ -329,12 +416,16 @@ function attachVadIfProvided(asrModel, options = {}) {
   return withVadModel(asrModel, vadModel, options.vadOptions);
 }
 
-async function createAsrModelWithVad(params, options = {}) {
+async function createAsrModelWithVad(
+  params: Record<string, unknown>,
+  options: NodeModelLoadOptions = {},
+): Promise<AsrTranscriber> {
   const asrModel = await createAsrModel(params);
   return attachVadIfProvided(asrModel, options);
 }
 
-export async function loadLocalVadModel(modelDir, options = {}) {
+/** Load a VAD model from a local directory or direct ONNX file path. */
+export async function loadLocalVadModel(modelDir: string, options: NodeHuggingFaceOptions = {}) {
   const quantization = options.quantization ?? "int8";
   const modelPath = modelDir.endsWith(".onnx")
     ? modelDir
@@ -346,7 +437,8 @@ export async function loadLocalVadModel(modelDir, options = {}) {
   });
 }
 
-export async function downloadHuggingfaceVadModel(repoId, options = {}) {
+/** Download a VAD model repo from Hugging Face into local cache. */
+export async function downloadHuggingfaceVadModel(repoId: string, options: NodeHuggingFaceOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
@@ -360,7 +452,7 @@ export async function downloadHuggingfaceVadModel(repoId, options = {}) {
   const baseUrl = resolveHfBaseUrl(repoId, revision, options.endpoint);
 
   const hfToken = options.hfToken ?? process.env.HF_TOKEN;
-  const headers = hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined;
+  const headers: HeadersMap | undefined = hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined;
   const requestOptions = { fetchImpl, headers, quantization };
 
   await mkdir(modelDir, { recursive: true });
@@ -374,12 +466,14 @@ export async function downloadHuggingfaceVadModel(repoId, options = {}) {
   return modelDir;
 }
 
-export async function loadHuggingfaceVadModel(repoId, options = {}) {
+/** Load a VAD model by Hugging Face repo id. */
+export async function loadHuggingfaceVadModel(repoId: string, options: NodeHuggingFaceOptions = {}) {
   const modelDir = await downloadHuggingfaceVadModel(repoId, options);
   return loadLocalVadModel(modelDir, options);
 }
 
-export async function loadLocalModel(modelDir, options = {}) {
+/** Load an ASR model from a local directory. */
+export async function loadLocalModel(modelDir: string, options: NodeModelLoadOptions = {}) {
   const quantization = options.quantization ?? "int8";
   const files = await walkFiles(modelDir);
 
@@ -479,8 +573,16 @@ export async function loadLocalModel(modelDir, options = {}) {
   }
 
   if (spec.decoderKind === "whisper-hf") {
-    const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
-    const decoderFile = await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization);
+    const encoderFile = await selectOrFallbackModelFile(
+      modelDir,
+      requireString(spec.encoder, "whisper config is missing encoder model path."),
+      quantization,
+    );
+    const decoderFile = await selectOrFallbackModelFile(
+      modelDir,
+      requireString(spec.decoderJoint, "whisper config is missing decoder model path."),
+      quantization,
+    );
 
     return createAsrModelWithVad({
       modelType,
@@ -497,7 +599,11 @@ export async function loadLocalModel(modelDir, options = {}) {
     }, options);
   }
 
-  const encoderFile = await selectOrFallbackModelFile(modelDir, spec.encoder, quantization);
+  const encoderFile = await selectOrFallbackModelFile(
+    modelDir,
+    requireString(spec.encoder, `model type '${modelType}' is missing encoder path.`),
+    quantization,
+  );
   const decoderFile = spec.decoderJoint
     ? await selectOrFallbackModelFile(modelDir, spec.decoderJoint, quantization)
     : null;
@@ -527,7 +633,8 @@ export async function loadLocalModel(modelDir, options = {}) {
   }, options);
 }
 
-export async function downloadHuggingfaceModel(repoId, options = {}) {
+/** Download an ASR model repo from Hugging Face into local cache. */
+export async function downloadHuggingfaceModel(repoId: string, options: NodeHuggingFaceOptions = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error("No fetch implementation available.");
@@ -541,7 +648,7 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
   const baseUrl = resolveHfBaseUrl(repoId, revision, options.endpoint);
 
   const hfToken = options.hfToken ?? process.env.HF_TOKEN;
-  const headers = hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined;
+  const headers: HeadersMap | undefined = hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined;
   const requestOptions = { fetchImpl, headers, quantization };
 
   await mkdir(modelDir, { recursive: true });
@@ -633,7 +740,10 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
   if (spec.decoderKind === "whisper-hf") {
     const repoFiles = await listHuggingFaceRepoFiles(repoId, revision, options.endpoint, requestOptions);
 
-    const modelFiles = [spec.encoder, spec.decoderJoint];
+    const modelFiles = [
+      requireString(spec.encoder, "whisper config is missing encoder model path."),
+      requireString(spec.decoderJoint, "whisper config is missing decoder model path."),
+    ];
     for (const baseFile of modelFiles) {
       const candidates = modelFilenameCandidates(baseFile, quantization);
       const selected = candidates.find((path) => repoFiles.has(path)) ?? candidates[candidates.length - 1];
@@ -653,7 +763,11 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
     return modelDir;
   }
 
-  const modelFiles = [spec.encoder, ...(spec.decoderJoint ? [spec.decoderJoint] : []), ...(spec.preprocessor ? [spec.preprocessor] : [])];
+  const modelFiles = [
+    requireString(spec.encoder, "model config is missing encoder model path."),
+    ...(spec.decoderJoint ? [spec.decoderJoint] : []),
+    ...(spec.preprocessor ? [spec.preprocessor] : []),
+  ];
 
   for (const filename of modelFiles) {
     const candidates = modelFilenameCandidates(filename, quantization);
@@ -696,7 +810,8 @@ export async function downloadHuggingfaceModel(repoId, options = {}) {
   return modelDir;
 }
 
-export async function loadHuggingfaceModel(repoId, options = {}) {
+/** Load an ASR model by Hugging Face repo id. */
+export async function loadHuggingfaceModel(repoId: string, options: NodeHuggingFaceOptions = {}) {
   const modelDir = await downloadHuggingfaceModel(repoId, options);
   return loadLocalModel(modelDir, options);
 }
